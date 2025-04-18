@@ -1,4 +1,6 @@
-#!/usr/bin/env python3
+
+#Issues outstanding, not standardizing clip length until end
+#not basing it off of first clip everytime
 from pythonosc import udp_client, dispatcher, osc_server
 import time
 import keyboard
@@ -11,6 +13,7 @@ base_clip_length = None  # Holds the length (in beats) of the first recorded cli
 # Global toggling variables.
 waiting_for_refire = False
 current_active_track = None  # The track index of the clip currently recording.
+all_clips_recorded = False   # Flag to indicate when all clips have been recorded
 
 def start_global_osc_server():
     global global_osc_server
@@ -54,6 +57,10 @@ class StateTracker:
         with self.lock:
             return [idx for idx, has_clip in self.track_has_clip.items() if not has_clip]
     
+    def are_all_tracks_filled(self):
+        with self.lock:
+            return all(self.track_has_clip.values())
+    
     def start_background_validation(self, client):
         if self.validation_thread is not None and self.validation_thread.is_alive():
             print("Background validation already running")
@@ -90,101 +97,203 @@ class StateTracker:
                 print(f"Error in background validation: {e}")
 
 # --- OSC Query Helpers ---
-def query_clip_markers(client, track_index, clip_slot_index, timeout=6.0):
+def query_clip_loop_points(client, track_index, clip_slot_index, timeout=6.0):
     """
-    Queries Ableton for the start and end markers of a clip.
-    Returns [start_marker, end_marker] (in beats) or [None, None] if not available.
+    Queries Ableton for the loop start and end positions of a clip.
+    Returns [loop_start, loop_end] (in beats) or [None, None] if not available.
     This function will wait (polling in a loop) until the timeout expires.
     """
     event = threading.Event()
     result = [None, None]
 
-    def start_marker_handler(unused_addr, *args):
+    def loop_start_handler(unused_addr, *args):
         # Debug: print raw args received.
-        print(f"[DEBUG] Start marker handler received args: {args}")
+        print(f"[DEBUG] Loop start handler received args: {args}")
         if len(args) >= 3:
             if int(args[0]) == track_index and int(args[1]) == clip_slot_index:
                 result[0] = float(args[2])
                 if result[1] is not None:
                     event.set()
 
-    def end_marker_handler(unused_addr, *args):
-        print(f"[DEBUG] End marker handler received args: {args}")
+    def loop_end_handler(unused_addr, *args):
+        print(f"[DEBUG] Loop end handler received args: {args}")
         if len(args) >= 3:
             if int(args[0]) == track_index and int(args[1]) == clip_slot_index:
                 result[1] = float(args[2])
                 if result[0] is not None:
                     event.set()
 
-    global_dispatcher.map("/live/clip/get/start_marker", start_marker_handler)
-    global_dispatcher.map("/live/clip/get/end_marker", end_marker_handler)
-    client.send_message("/live/clip/get/start_marker", [track_index, clip_slot_index])
-    client.send_message("/live/clip/get/end_marker", [track_index, clip_slot_index])
+    global_dispatcher.map("/live/clip/get/loop_start", loop_start_handler)
+    global_dispatcher.map("/live/clip/get/loop_end", loop_end_handler)
+    
+    # Clear any previous messages in the queue
+    time.sleep(0.02)
+    
+    # Send the queries with a small delay between them
+    client.send_message("/live/clip/get/loop_start", [track_index, clip_slot_index])
+    time.sleep(0.05)  # Added delay between messages to ensure they're processed separately
+    client.send_message("/live/clip/get/loop_end", [track_index, clip_slot_index])
+    
     start_time = time.time()
     while not event.is_set() and time.time() - start_time < timeout:
         time.sleep(0.1)
-    global_dispatcher.unmap("/live/clip/get/start_marker", start_marker_handler)
-    global_dispatcher.unmap("/live/clip/get/end_marker", end_marker_handler)
+    
+    global_dispatcher.unmap("/live/clip/get/loop_start", loop_start_handler)
+    global_dispatcher.unmap("/live/clip/get/loop_end", loop_end_handler)
+    
+    print(f"[DEBUG] Final query result for track {track_index+1}, slot {clip_slot_index+1}: {result}")
     return result
 
-def enforce_clip_markers(client, track_index, clip_slot_index, expected_start, expected_end, delay=0.5, timeout=2.0):
+def enforce_clip_loop_points(client, track_index, clip_slot_index, expected_start, expected_end, delay=0.5, timeout=2.0):
     """
-    After a delay, queries back the markers and, if they do not match the expected values,
+    After a delay, queries back the loop points and, if they do not match the expected values,
     re-sends the set commands.
     """
     time.sleep(delay)
-    markers = query_clip_markers(client, track_index, clip_slot_index, timeout)
-    print(f"[DEBUG] Enforcement: Queried markers for track {track_index+1}, slot {clip_slot_index+1}: {markers}")
-    if markers[0] != expected_start or markers[1] != expected_end:
-        print(f"[DEBUG] Markers mismatch. Re-sending commands: start={expected_start}, end={expected_end}")
-        client.send_message("/live/clip/set/start_marker", [track_index, clip_slot_index, expected_start])
-        client.send_message("/live/clip/set/end_marker", [track_index, clip_slot_index, expected_end])
-        markers = query_clip_markers(client, track_index, clip_slot_index, timeout)
-        print(f"[DEBUG] Markers after enforcement: {markers}")
+    loop_points = query_clip_loop_points(client, track_index, clip_slot_index, timeout)
+    print(f"[DEBUG] Enforcement: Queried loop points for track {track_index+1}, slot {clip_slot_index+1}: {loop_points}")
+    if loop_points[0] != expected_start or loop_points[1] != expected_end:
+        print(f"[DEBUG] Loop points mismatch. Re-sending commands: start={expected_start}, end={expected_end}")
+        
+        # Clear any previous messages
+        time.sleep(0.02)
+        
+        # Send commands with delay between them
+        client.send_message("/live/clip/set/loop_start", [track_index, clip_slot_index, expected_start])
+        time.sleep(0.05)
+        client.send_message("/live/clip/set/loop_end", [track_index, clip_slot_index, expected_end])
+        
+        time.sleep(0.5)  # Wait for commands to be processed
+        
+        loop_points = query_clip_loop_points(client, track_index, clip_slot_index, timeout)
+        print(f"[DEBUG] Loop points after enforcement: {loop_points}")
     else:
-        print("[DEBUG] Markers correctly set.")
+        print("[DEBUG] Loop points correctly set.")
 
-# --- Finalizing Recording ---
-def finalize_recording(client, track_index, clip_slot_index):
+# --- Initializing Base Clip Length ---
+def initialize_base_clip_length(client, state_tracker):
     """
-    After a recording has been stopped by re-firing the clip, this function waits and
-    polls repeatedly for valid start and end markers.
-    • If the finalized clip is the first clip (track 1, slot 1) and base_clip_length is unset,
-      it updates base_clip_length.
-    • For subsequent clips, if base_clip_length is available, it enforces that the clip's
-      markers match (start = 0.0, end = base_clip_length).
+    Attempts to get the loop length from track 0, clip 0 and set it as the base clip length.
     """
     global base_clip_length
+    
+    if not state_tracker.track_has_clip[0]:
+        print("[ERROR] Cannot initialize base clip length - track 1, slot 1 has no clip.")
+        return False
+    
+    print("[DEBUG] Initializing base clip length from track 1, slot 1...")
+    
+    # Try multiple times if needed
+    for attempt in range(3):
+        # Give Ableton time to finish processing
+        time.sleep(0.5)
+        
+        loop_points = query_clip_loop_points(client, 0, 0, timeout=2.0)
+        if loop_points[0] is not None and loop_points[1] is not None:
+            base_clip_length = loop_points[1] - loop_points[0]
+            print(f"[DEBUG] Base clip length set to {base_clip_length} beats (attempt {attempt+1}).")
+            return True
+        else:
+            print(f"[DEBUG] Failed to get loop points on attempt {attempt+1}, retrying...")
+    
+    print("[ERROR] Failed to initialize base clip length after multiple attempts.")
+    return False
+
+# --- Finalizing Recording ---
+def finalize_recording(client, track_index, clip_slot_index, state_tracker):
+    """
+    After a recording has been stopped by re-firing the clip, this function waits and
+    polls repeatedly for valid loop start and end points.
+    • If the finalized clip is the first clip (track 1, slot 1) and base_clip_length is unset,
+      it updates base_clip_length.
+    • It checks if all tracks are now filled, and if so, triggers the synchronization.
+    """
+    global base_clip_length, all_clips_recorded
     print(f"[DEBUG] Finalizing recording on track {track_index+1}, slot {clip_slot_index+1}...")
+    
+    # Wait for the clip to be properly loaded after recording
+    time.sleep(1.0)
+    
     max_attempts = 20  # Poll up to 20 times (e.g., 10 seconds with a 0.5-second interval)
     attempt = 0
-    markers = [None, None]
+    loop_points = [None, None]
     while attempt < max_attempts:
-        markers = query_clip_markers(client, track_index, clip_slot_index, timeout=1.0)
-        if markers[0] is not None and markers[1] is not None:
+        loop_points = query_clip_loop_points(client, track_index, clip_slot_index, timeout=1.0)
+        if loop_points[0] is not None and loop_points[1] is not None:
             break
         attempt += 1
         time.sleep(0.5)
-    print(f"[DEBUG] Final markers for track {track_index+1}, slot {clip_slot_index+1}: {markers}")
-    if markers[0] is not None and markers[1] is not None:
-        clip_length = markers[1] - markers[0]
+    
+    print(f"[DEBUG] Final loop points for track {track_index+1}, slot {clip_slot_index+1}: {loop_points}")
+    
+    if loop_points[0] is not None and loop_points[1] is not None:
+        clip_length = loop_points[1] - loop_points[0]
+        
+        # If this is the first clip, set the base clip length
         if base_clip_length is None and track_index == 0 and clip_slot_index == 0:
             base_clip_length = clip_length
             print(f"[DEBUG] Base clip length updated to {base_clip_length} beats (from first clip).")
-        elif base_clip_length is not None:
-            print(f"[DEBUG] Enforcing markers for track {track_index+1}, slot {clip_slot_index+1} to base length {base_clip_length}.")
-            client.send_message("/live/clip/set/start_marker", [track_index, clip_slot_index, 0.0])
-            client.send_message("/live/clip/set/end_marker", [track_index, clip_slot_index, base_clip_length])
-            threading.Thread(target=enforce_clip_markers, args=(client, track_index, clip_slot_index, 0.0, base_clip_length), daemon=True).start()
+        
+        # Check if all designated tracks now have clips
+        if state_tracker.are_all_tracks_filled():
+            print("[DEBUG] All designated tracks now have clips. Starting synchronization after delay...")
+            all_clips_recorded = True
+            # Use a timer to allow a moment for final processing
+            update_timer = threading.Timer(2.0, update_all_clips_loop_points, args=(client, state_tracker))
+            update_timer.daemon = True
+            update_timer.start()
     else:
-        print("[DEBUG] Unable to capture marker values after finalization.")
+        print("[DEBUG] Unable to capture loop point values after finalization.")
+
+# --- Update All Clips Loop Points ---
+def update_all_clips_loop_points(client, state_tracker):
+    """
+    Updates all recorded clips to have the same loop_end value based on the global base_clip_length.
+    This is called automatically after all clips have been recorded or manually via keyboard shortcut.
+    """
+    global base_clip_length
+    
+    # If base_clip_length is not set, try to get it from track 0
+    if base_clip_length is None:
+        if not initialize_base_clip_length(client, state_tracker):
+            print("[ERROR] Cannot update clips - failed to establish base length.")
+            return
+    
+    filled_tracks = state_tracker.get_filled_tracks()
+    print(f"Updating loop points for all clips to match length: {base_clip_length} beats")
+    
+    for track_idx in filled_tracks:
+        print(f"Setting loop points for track {track_idx+1}, slot {state_tracker.clip_slot_index+1}")
+        
+        # Clear any previous messages
+        time.sleep(0.05)
+        
+        # Send the set commands with a delay between them
+        client.send_message("/live/clip/set/loop_start", [track_idx, state_tracker.clip_slot_index, 0.0])
+        time.sleep(0.05)
+        client.send_message("/live/clip/set/loop_end", [track_idx, state_tracker.clip_slot_index, base_clip_length])
+        
+        # Wait briefly before moving to the next track
+        time.sleep(0.2)
+    
+    # After setting all clips, verify each one in separate threads
+    for track_idx in filled_tracks:
+        threading.Thread(
+            target=enforce_clip_loop_points, 
+            args=(client, track_idx, state_tracker.clip_slot_index, 0.0, base_clip_length),
+            daemon=True
+        ).start()
+        # Stagger the verification threads
+        time.sleep(0.1)
+    
+    print("[DEBUG] All clips updated to match base length.")
 
 # --- Recording Function ---
 def record_clip(client, track_index, clip_slot_index, state_tracker):
     """
     Fires a clip slot to record a new clip.
     This function disarms all tracks, arms the chosen track, and fires the clip slot.
-    It does not finalize (query markers) immediately.
+    It does not finalize (query loop points) immediately.
     Instead, toggling behavior (via comma key) will control stopping and finalization.
     """
     print(f"Recording new clip on track {track_index+1}, slot {clip_slot_index+1}")
@@ -241,11 +350,11 @@ def check_track_has_clip(client, track_index, clip_slot_index):
     global_dispatcher.map("/live/clip_slot/get/has_clip", handler)
     global_dispatcher.map("/live/clip/get/exists/return", handler)
     client.send_message("/live/clip_slot/get/has_clip", [track_index, clip_slot_index])
-    time.sleep(0.0005)
+    time.sleep(0.005)  # Increased delay to ensure message is sent
     client.send_message("/live/clip/get/exists", [track_index, clip_slot_index])
     start_time = time.time()
-    while not event.is_set() and time.time() - start_time < 0.3:
-        time.sleep(0.005)
+    while not event.is_set() and time.time() - start_time < 0.5:  # Increased timeout
+        time.sleep(0.01)  # Increased polling interval
     global_dispatcher.unmap("/live/clip_slot/get/has_clip/return", handler)
     global_dispatcher.unmap("/live/clip_slot/get/has_clip", handler)
     global_dispatcher.unmap("/live/clip/get/exists/return", handler)
@@ -256,7 +365,7 @@ def check_track_has_clip(client, track_index, clip_slot_index):
 
 # --- Main and Keyboard Handling ---
 def main():
-    global waiting_for_refire, current_active_track
+    global waiting_for_refire, current_active_track, all_clips_recorded
     start_global_osc_server()
     state_tracker = StateTracker()
     ip = "127.0.0.1"   # AbletonOSC sending address
@@ -275,6 +384,7 @@ def main():
     print("- Press ',' to toggle recording/refiring")
     print("- Press '.' to stop all clips (playback only)")
     print("- Press '/' to force state validation with Ableton")
+    print("- Press 's' to synchronize all clips to the same length")
     print("- Press 'up' and 'down' for other controls (not used here)")
     print("- Press 'esc' to exit")
     
@@ -282,7 +392,7 @@ def main():
     
     def handle_comma_press(e):
         nonlocal is_processing
-        global waiting_for_refire, current_active_track
+        global waiting_for_refire, current_active_track, all_clips_recorded
         with threading.Lock():
             if is_processing:
                 print("Already processing a command. Please wait...")
@@ -294,9 +404,17 @@ def main():
                     print(f"Refiring clip in track {current_active_track+1}, slot {state_tracker.clip_slot_index+1} to stop recording.")
                     client.send_message("/live/clip_slot/fire", [current_active_track, state_tracker.clip_slot_index])
                     # Finalize the recording in a background thread.
-                    threading.Thread(target=finalize_recording, args=(client, current_active_track, state_tracker.clip_slot_index), daemon=True).start()
+                    threading.Thread(
+                        target=finalize_recording, 
+                        args=(client, current_active_track, state_tracker.clip_slot_index, state_tracker), 
+                        daemon=True
+                    ).start()
                     waiting_for_refire = False
                 else:
+                    # Reset sync flag when starting a new recording session
+                    if all_clips_recorded:
+                        all_clips_recorded = False
+                    
                     # First or third press: record a new clip.
                     track_to_use = state_tracker.get_next_empty_track()
                     if track_to_use is None:
@@ -326,15 +444,29 @@ def main():
             finally:
                 is_processing = False
     
+    def sync_all_clips(e):
+        nonlocal is_processing
+        with threading.Lock():
+            if is_processing:
+                print("Already processing a command. Please wait...")
+                return
+            is_processing = True
+            try:
+                print("Manually triggering clip synchronization...")
+                update_all_clips_loop_points(client, state_tracker)
+            finally:
+                is_processing = False
+    
     def handle_up_press(e):
-        print("Up key pressed (no marker action)")
+        print("Up key pressed (no loop action)")
     
     def handle_down_press(e):
-        print("Down key pressed (no marker action)")
+        print("Down key pressed (no loop action)")
     
     keyboard.on_press_key(',', handle_comma_press)
     keyboard.on_press_key('.', stop_clips)
     keyboard.on_press_key('/', force_validation)
+    keyboard.on_press_key('s', sync_all_clips)  # Manual synchronization shortcut
     keyboard.on_press_key('up', handle_up_press)
     keyboard.on_press_key('down', handle_down_press)
     
