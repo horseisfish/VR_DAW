@@ -1,6 +1,4 @@
-
-#Issues outstanding, not standardizing clip length until end
-#not basing it off of first clip everytime
+#Issues outstanding
 from pythonosc import udp_client, dispatcher, osc_server
 import time
 import keyboard
@@ -15,6 +13,9 @@ waiting_for_refire = False
 current_active_track = None  # The track index of the clip currently recording.
 all_clips_recorded = False   # Flag to indicate when all clips have been recorded
 
+# Global flag to control the running state
+running = True
+
 def start_global_osc_server():
     global global_osc_server
     ip = "127.0.0.1"
@@ -23,7 +24,7 @@ def start_global_osc_server():
     thread = threading.Thread(target=global_osc_server.serve_forever, daemon=True)
     thread.start()
     print(f"Global OSC server started on {ip}:{port}")
-    return thread
+    return thread,
 
 # --- State Tracking ---
 class StateTracker:
@@ -61,14 +62,14 @@ class StateTracker:
         with self.lock:
             return all(self.track_has_clip.values())
     
-    def start_background_validation(self, client):
+    def start_background_validation(self, client, ip_addresses):
         if self.validation_thread is not None and self.validation_thread.is_alive():
             print("Background validation already running")
             return
         self.validation_running = True
         self.validation_thread = threading.Thread(
             target=self._background_validation_loop,
-            args=(client,),
+            args=(client, ip_addresses),
             daemon=True
         )
         self.validation_thread.start()
@@ -80,7 +81,7 @@ class StateTracker:
             self.validation_thread.join(timeout=1.0)
             print("Background validation stopped")
     
-    def _background_validation_loop(self, client):
+    def _background_validation_loop(self, client, ip_addresses):
         print("Background validation thread started")
         while self.validation_running:
             for _ in range(int(self.validation_interval * 2)):
@@ -92,9 +93,35 @@ class StateTracker:
             try:
                 print("\n=== Background validation running ===")
                 validate_state_with_ableton(client, self)
+                self.send_clip_presence_update(client, ip_addresses)  # Send OSC message
                 print("=== Background validation complete ===\n")
             except Exception as e:
                 print(f"Error in background validation: {e}")
+
+    def get_clip_presence_grid(self, client):
+        """
+        Generates a grid of 0s and 1s representing the presence of clips.
+        The format is VROSC/t1/cs1/.../t8/cs3/...
+        """
+        grid = []
+
+        for track_idx in range(8):  # Tracks 1 to 8
+            for clip_slot in range(3):  # Clip slots 1 to 3
+                # Query Ableton for the presence of a clip in the specified track and slot
+                has_clip = check_track_has_clip(client, track_idx, clip_slot)
+                grid.append(1 if has_clip else 0)  # Append 1 if there's a clip, otherwise 0
+
+        return grid
+
+    def send_clip_presence_update(self, client2, ip_addresses):
+        """
+        Sends the OSC message reflecting the presence of clips to the specified IP addresses.
+        """
+        grid = self.get_clip_presence_grid(client2)
+        for ip in ip_addresses:
+            message = f"VROSC/t1/{grid[0]}/{grid[1]}/{grid[2]}/t2/{grid[3]}/{grid[4]}/{grid[5]}/t3/{grid[6]}/{grid[7]}/{grid[8]}/t4/{grid[9]}/{grid[10]}/{grid[11]}/t5/{grid[12]}/{grid[13]}/{grid[14]}/t6/{grid[15]}/{grid[16]}/{grid[17]}/t7/{grid[18]}/{grid[19]}/{grid[20]}/t8/{grid[21]}/{grid[22]}/{grid[23]}"
+            client2.send_message(message, [])
+            print(f"Sent OSC message to {ip}: {message}")
 
 # --- OSC Query Helpers ---
 def query_clip_loop_points(client, track_index, clip_slot_index, timeout=6.0):
@@ -233,6 +260,10 @@ def finalize_recording(client, track_index, clip_slot_index, state_tracker):
         if base_clip_length is None and track_index == 0 and clip_slot_index == 0:
             base_clip_length = clip_length
             print(f"[DEBUG] Base clip length updated to {base_clip_length} beats (from first clip).")
+        elif base_clip_length is not None and clip_length < base_clip_length:
+            # Update base_clip_length only if the new clip length is shorter
+            base_clip_length = clip_length
+            print(f"[DEBUG] Base clip length updated to {base_clip_length} beats (from subsequent clip).")
         
         # Check if all designated tracks now have clips
         if state_tracker.are_all_tracks_filled():
@@ -328,7 +359,7 @@ def verify_ableton_connection(client, timeout=1.0):
 
 def validate_state_with_ableton(client, state_tracker):
     print("Validating internal clip state with Ableton...")
-    for track_idx in [0, 2, 4, 6]:
+    for track_idx in [0,2,4,6]:
         has_clip = check_track_has_clip(client, track_idx, state_tracker.clip_slot_index)
         state_tracker.mark_track_has_clip(track_idx, has_clip)
     filled_tracks = [t+1 for t in state_tracker.get_filled_tracks()]
@@ -363,14 +394,39 @@ def check_track_has_clip(client, track_index, clip_slot_index):
         return False
     return result[0]
 
+# --- Simplified Clip Length Update Function ---
+def update_clip_lengths(client, state_tracker):
+    """
+    Periodically checks the length of the clip in track 1, slot 1,
+    and updates the lengths of the other clips to match.
+    """
+    if not state_tracker.track_has_clip[0]:  # Check if track 1 has a clip
+        print("[INFO] Track 1, slot 1 has no clip. Skipping update.")
+        return
+
+    loop_points = query_clip_loop_points(client, 0, 0)  # Get loop points for track 1, slot 1
+    if loop_points[0] is not None and loop_points[1] is not None:
+        base_clip_length = loop_points[1] - loop_points[0]
+        print(f"[INFO] Base clip length: {base_clip_length} beats")
+
+        filled_tracks = state_tracker.get_filled_tracks()
+        for track_idx in filled_tracks:
+            print(f"Updating loop points for track {track_idx+1} to match length: {base_clip_length} beats")
+            client.send_message("/live/clip/set/loop_start", [track_idx, state_tracker.clip_slot_index, 0.0])
+            client.send_message("/live/clip/set/loop_end", [track_idx, state_tracker.clip_slot_index, base_clip_length])
+    else:
+        print("[ERROR] Unable to retrieve loop points for track 1, slot 1.")
+
 # --- Main and Keyboard Handling ---
 def main():
+    global running  # Use the global flag
     global waiting_for_refire, current_active_track, all_clips_recorded
     start_global_osc_server()
     state_tracker = StateTracker()
     ip = "127.0.0.1"   # AbletonOSC sending address
     port = 11000       # AbletonOSC sending port
     client = udp_client.SimpleUDPClient(ip, port)
+    client2 = udp_client.SimpleUDPClient("192.168.1.10",7001)
     
     print(f"Attempting to connect to AbletonOSC server at {ip}:{port}")
     if not verify_ableton_connection(client):
@@ -378,7 +434,8 @@ def main():
         return
     
     validate_state_with_ableton(client, state_tracker)
-    state_tracker.start_background_validation(client)
+    ip_addresses = ["192.168.1.10", "192.168.1.11"]  # IP addresses for VR headsets
+    state_tracker.start_background_validation(client, ip_addresses)
     
     print("Foot controller started.")
     print("- Press ',' to toggle recording/refiring")
@@ -403,6 +460,7 @@ def main():
                     # Second press: re-fire current clip to stop recording.
                     print(f"Refiring clip in track {current_active_track+1}, slot {state_tracker.clip_slot_index+1} to stop recording.")
                     client.send_message("/live/clip_slot/fire", [current_active_track, state_tracker.clip_slot_index])
+                    client2.send_message("/sessiontrack",[1,current_active_track])
                     # Finalize the recording in a background thread.
                     threading.Thread(
                         target=finalize_recording, 
@@ -419,9 +477,11 @@ def main():
                     track_to_use = state_tracker.get_next_empty_track()
                     if track_to_use is None:
                         print("All designated tracks (1, 3, 5, 7) are full! Clear some clips before recording more.")
+                        client2.send_message("/sessiontrack",["all tracks full"])
                         return
                     print(f"Recording new clip in track {track_to_use+1}, slot {state_tracker.clip_slot_index+1}")
                     record_clip(client, track_to_use, state_tracker.clip_slot_index, state_tracker)
+                    client2.send_message("/sessiontrack",[1,track_to_use])
                     current_active_track = track_to_use
                     waiting_for_refire = True
             finally:
@@ -463,18 +523,36 @@ def main():
     def handle_down_press(e):
         print("Down key pressed (no loop action)")
     
+    def stop_program(e):
+        global running
+        print("Exiting foot controller...")
+        running = False  # Set the flag to False to stop the program
+    
     keyboard.on_press_key(',', handle_comma_press)
     keyboard.on_press_key('.', stop_clips)
     keyboard.on_press_key('/', force_validation)
     keyboard.on_press_key('s', sync_all_clips)  # Manual synchronization shortcut
     keyboard.on_press_key('up', handle_up_press)
     keyboard.on_press_key('down', handle_down_press)
+    keyboard.on_press_key('esc', stop_program)  # Listen for the escape key
     
-    keyboard.wait('esc')
-    print("Exiting foot controller...")
-    state_tracker.stop_background_validation()
-    if global_osc_server:
-        global_osc_server.shutdown()
+    # Start periodic updates
+    def periodic_update():
+        if running:  # Check if the program should continue running
+            update_clip_lengths(client, state_tracker)
+            threading.Timer(5.0, periodic_update).start()  # Check every 5 seconds
+        else:
+            state_tracker.stop_background_validation()  # Stop any background validation
+            if global_osc_server:
+                global_osc_server.shutdown()  # Shutdown the OSC server
+
+    periodic_update()  # Start the periodic update
+
+    # Main loop to keep the program running
+    while running:
+        time.sleep(0.1)  # Sleep briefly to avoid busy waiting
+
+    print("Foot controller has stopped.")
 
 if __name__ == "__main__":
     main()
