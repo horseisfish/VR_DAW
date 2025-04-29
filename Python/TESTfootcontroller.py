@@ -1,4 +1,7 @@
 #Issues outstanding
+## needs OSC messages added to control Unity
+# retains double arming after recording a clip. just messy if playing without recording, but nbd
+ 
 from pythonosc import udp_client, dispatcher, osc_server
 import time
 import keyboard
@@ -122,6 +125,16 @@ class StateTracker:
             message = f"VROSC/t1/{grid[0]}/{grid[1]}/{grid[2]}/t2/{grid[3]}/{grid[4]}/{grid[5]}/t3/{grid[6]}/{grid[7]}/{grid[8]}/t4/{grid[9]}/{grid[10]}/{grid[11]}/t5/{grid[12]}/{grid[13]}/{grid[14]}/t6/{grid[15]}/{grid[16]}/{grid[17]}/t7/{grid[18]}/{grid[19]}/{grid[20]}/t8/{grid[21]}/{grid[22]}/{grid[23]}"
             client2.send_message(message, [])
             print(f"Sent OSC message to {ip}: {message}")
+
+    def get_next_track(self, current_track):
+        """
+        Returns the next track index in the series (0, 2, 4, 6).
+        Wraps around to the first track if the end is reached.
+        """
+        designated_tracks = [0, 2, 4, 6]  # Tracks 1, 3, 5, 7
+        current_index = designated_tracks.index(current_track)
+        next_index = (current_index + 1) % len(designated_tracks)
+        return designated_tracks[next_index]
 
 # --- OSC Query Helpers ---
 def query_clip_loop_points(client, track_index, clip_slot_index, timeout=6.0):
@@ -461,12 +474,20 @@ def main():
                     print(f"Refiring clip in track {current_active_track+1}, slot {state_tracker.clip_slot_index+1} to stop recording.")
                     client.send_message("/live/clip_slot/fire", [current_active_track, state_tracker.clip_slot_index])
                     client2.send_message("/sessiontrack",[1,current_active_track])
+
+                    
                     # Finalize the recording in a background thread.
                     threading.Thread(
                         target=finalize_recording, 
                         args=(client, current_active_track, state_tracker.clip_slot_index, state_tracker), 
                         daemon=True
                     ).start()
+                    
+                    # Arm the next track in the series
+                    next_track = state_tracker.get_next_track(current_active_track)
+                    client.send_message("/live/track/set/arm", [next_track, 1])  # Arm the next track
+                    print(f"Next track {next_track+1} armed for recording.")
+                    
                     waiting_for_refire = False
                 else:
                     # Reset sync flag when starting a new recording session
@@ -478,10 +499,13 @@ def main():
                     if track_to_use is None:
                         print("All designated tracks (1, 3, 5, 7) are full! Clear some clips before recording more.")
                         client2.send_message("/sessiontrack",["all tracks full"])
+
                         return
+                    
                     print(f"Recording new clip in track {track_to_use+1}, slot {state_tracker.clip_slot_index+1}")
                     record_clip(client, track_to_use, state_tracker.clip_slot_index, state_tracker)
                     client2.send_message("/sessiontrack",[1,track_to_use])
+
                     current_active_track = track_to_use
                     waiting_for_refire = True
             finally:
