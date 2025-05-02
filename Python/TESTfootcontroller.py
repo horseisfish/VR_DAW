@@ -1,6 +1,8 @@
-#Issues outstanding
-## needs OSC messages added to control Unity
+####Issues outstanding#####
+## needs OSC messages added to control Unity *some added
+## needs to consider main functions associated with Unity interaction (e.g. play, pause, delete tracks) * added not tested, need launch session
 # retains double arming after recording a clip. just messy if playing without recording, but nbd
+# there is redundancy in the state_tracker that is worth optimizing
  
 from pythonosc import udp_client, dispatcher, osc_server
 import time
@@ -12,12 +14,18 @@ global_dispatcher = dispatcher.Dispatcher()
 global_osc_server = None
 base_clip_length = None  # Holds the length (in beats) of the first recorded clip.
 # Global toggling variables.
-waiting_for_refire = False
-current_active_track = None  # The track index of the clip currently recording.
+waiting_for_refire_player1 = False
+waiting_for_refire_player2 = False
+current_active_track_player1 = None
+current_active_track_player2 = None
 all_clips_recorded = False   # Flag to indicate when all clips have been recorded
 
 # Global flag to control the running state
 running = True
+
+# Add separate processing flags for each player
+is_processing_player1 = False
+is_processing_player2 = False
 
 def start_global_osc_server():
     global global_osc_server
@@ -27,13 +35,13 @@ def start_global_osc_server():
     thread = threading.Thread(target=global_osc_server.serve_forever, daemon=True)
     thread.start()
     print(f"Global OSC server started on {ip}:{port}")
-    return thread,
+    return thread
 
 # --- State Tracking ---
 class StateTracker:
     def __init__(self):
-        # Designated tracks: tracks 1, 3, 5, 7 (indexes 0, 2, 4, 6)
-        self.track_has_clip = {0: False, 2: False, 4: False, 6: False}
+        # Designated tracks: Player 1 (1, 3, 5, 7) and Player 2 (2, 4, 6, 8)
+        self.track_has_clip = {0: False, 1: False, 2: False, 3: False, 4: False, 5: False, 6: False, 7: False}
         self.clip_slot_index = 0  # Always using the first clip slot.
         self.validation_interval = 7.0  # For background validation.
         self.validation_running = False
@@ -46,24 +54,38 @@ class StateTracker:
                 self.track_has_clip[track_index] = has_clip
                 print(f"Internal state updated: Track {track_index+1} has clip: {has_clip}")
     
-    def get_next_empty_track(self):
+    def get_next_empty_track(self, player):
         with self.lock:
-            for track_idx in [0, 2, 4, 6]:
-                if not self.track_has_clip[track_idx]:
-                    return track_idx
+            if player == 1:  # Player 1 tracks (1, 3, 5, 7)
+                for track_idx in [0, 2, 4, 6]:
+                    if not self.track_has_clip[track_idx]:
+                        return track_idx
+            elif player == 2:  # Player 2 tracks (2, 4, 6, 8)
+                for track_idx in [1, 3, 5, 7]:
+                    if not self.track_has_clip[track_idx]:
+                        return track_idx
             return None
     
-    def get_filled_tracks(self):
+    def get_filled_tracks(self, player):
         with self.lock:
-            return [idx for idx, has_clip in self.track_has_clip.items() if has_clip]
+            if player == 1:
+                return [idx for idx in [0, 2, 4, 6] if self.track_has_clip[idx]]
+            elif player == 2:
+                return [idx for idx in [1, 3, 5, 7] if self.track_has_clip[idx]]
     
-    def get_empty_tracks(self):
+    def get_empty_tracks(self, player):
         with self.lock:
-            return [idx for idx, has_clip in self.track_has_clip.items() if not has_clip]
+            if player == 1:
+                return [idx for idx in [0, 2, 4, 6] if not self.track_has_clip[idx]]
+            elif player == 2:
+                return [idx for idx in [1, 3, 5, 7] if not self.track_has_clip[idx]]
     
-    def are_all_tracks_filled(self):
+    def are_all_tracks_filled(self, player):
         with self.lock:
-            return all(self.track_has_clip.values())
+            if player == 1:
+                return all(self.track_has_clip[idx] for idx in [0, 2, 4, 6])
+            elif player == 2:
+                return all(self.track_has_clip[idx] for idx in [1, 3, 5, 7])
     
     def start_background_validation(self, client, ip_addresses):
         if self.validation_thread is not None and self.validation_thread.is_alive():
@@ -95,11 +117,22 @@ class StateTracker:
                 break
             try:
                 print("\n=== Background validation running ===")
-                validate_state_with_ableton(client, self)
+                self.validate_state_with_ableton(client)
                 self.send_clip_presence_update(client, ip_addresses)  # Send OSC message
                 print("=== Background validation complete ===\n")
             except Exception as e:
                 print(f"Error in background validation: {e}")
+
+    def validate_state_with_ableton(self, client):
+        print("Validating internal clip state with Ableton...")
+        for track_idx in range(8):  # Check all tracks 1-8
+            has_clip = check_track_has_clip(client, track_idx, self.clip_slot_index)
+            self.mark_track_has_clip(track_idx, has_clip)
+
+        filled_tracks = [t + 1 for t in self.get_filled_tracks(1)] + [t + 1 for t in self.get_filled_tracks(2)]
+        empty_tracks = [t + 1 for t in self.get_empty_tracks(1)] + [t + 1 for t in self.get_empty_tracks(2)]
+        print(f"Current state - Tracks with clips: {filled_tracks if filled_tracks else 'none'}")
+        print(f"Current state - Empty tracks: {empty_tracks if empty_tracks else 'none'}")
 
     def get_clip_presence_grid(self, client):
         """
@@ -126,12 +159,16 @@ class StateTracker:
             client2.send_message(message, [])
             print(f"Sent OSC message to {ip}: {message}")
 
-    def get_next_track(self, current_track):
+    def get_next_track(self, current_track, player):
         """
-        Returns the next track index in the series (0, 2, 4, 6).
+        Returns the next track index in the series based on the player.
         Wraps around to the first track if the end is reached.
         """
-        designated_tracks = [0, 2, 4, 6]  # Tracks 1, 3, 5, 7
+        if player == 1:
+            designated_tracks = [0, 2, 4, 6]  # Tracks 1, 3, 5, 7
+        else:
+            designated_tracks = [1, 3, 5, 7]  # Tracks 2, 4, 6, 8
+
         current_index = designated_tracks.index(current_track)
         next_index = (current_index + 1) % len(designated_tracks)
         return designated_tracks[next_index]
@@ -279,7 +316,7 @@ def finalize_recording(client, track_index, clip_slot_index, state_tracker):
             print(f"[DEBUG] Base clip length updated to {base_clip_length} beats (from subsequent clip).")
         
         # Check if all designated tracks now have clips
-        if state_tracker.are_all_tracks_filled():
+        if state_tracker.are_all_tracks_filled(1) or state_tracker.are_all_tracks_filled(2):
             print("[DEBUG] All designated tracks now have clips. Starting synchronization after delay...")
             all_clips_recorded = True
             # Use a timer to allow a moment for final processing
@@ -303,7 +340,7 @@ def update_all_clips_loop_points(client, state_tracker):
             print("[ERROR] Cannot update clips - failed to establish base length.")
             return
     
-    filled_tracks = state_tracker.get_filled_tracks()
+    filled_tracks = state_tracker.get_filled_tracks(1) + state_tracker.get_filled_tracks(2)
     print(f"Updating loop points for all clips to match length: {base_clip_length} beats")
     
     for track_idx in filled_tracks:
@@ -333,21 +370,45 @@ def update_all_clips_loop_points(client, state_tracker):
     print("[DEBUG] All clips updated to match base length.")
 
 # --- Recording Function ---
-def record_clip(client, track_index, clip_slot_index, state_tracker):
-    """
-    Fires a clip slot to record a new clip.
-    This function disarms all tracks, arms the chosen track, and fires the clip slot.
-    It does not finalize (query loop points) immediately.
-    Instead, toggling behavior (via comma key) will control stopping and finalization.
-    """
-    print(f"Recording new clip on track {track_index+1}, slot {clip_slot_index+1}")
-    for i in range(8):
-        client.send_message("/live/track/set/arm", [i, 0])
-    client.send_message("/live/track/set/arm", [track_index, 1])
-    client.send_message("/live/clip_slot/fire", [track_index, clip_slot_index])
-    state_tracker.mark_track_has_clip(track_index, True)
-    print(f"Recording started on track {track_index+1}, slot {clip_slot_index+1}")
-    return
+def record_clip_player1(client, state_tracker):
+    track_to_use = state_tracker.get_next_empty_track(1)
+    if track_to_use is None:
+        print("Player 1: All designated tracks (1, 3, 5, 7) are full! Clear some clips before recording more.")
+        return
+
+    print(f"Player 1: Recording new clip in track {track_to_use + 1}, slot {state_tracker.clip_slot_index + 1}")
+    
+    # Disarm only Player 1's tracks
+    for i in [0, 2, 4, 6]:  # Player 1's designated tracks
+        client.send_message("/live/track/set/arm", [i, 0])  # Disarm Player 1's tracks
+    client.send_message("/live/track/set/arm", [track_to_use, 1])  # Arm the selected track
+    client.send_message("/live/clip_slot/fire", [track_to_use, state_tracker.clip_slot_index])
+    state_tracker.mark_track_has_clip(track_to_use, True)
+    
+    # Update the active track for Player 1
+    global current_active_track_player1
+    current_active_track_player1 = track_to_use
+    print(f"Player 1: Recording started on track {track_to_use + 1}, slot {state_tracker.clip_slot_index + 1}")
+
+def record_clip_player2(client, state_tracker):
+    track_to_use = state_tracker.get_next_empty_track(2)
+    if track_to_use is None:
+        print("Player 2: All designated tracks (2, 4, 6, 8) are full! Clear some clips before recording more.")
+        return
+
+    print(f"Player 2: Recording new clip in track {track_to_use + 1}, slot {state_tracker.clip_slot_index + 1}")
+    
+    # Disarm only Player 2's tracks
+    for i in [1, 3, 5, 7]:  # Player 2's designated tracks
+        client.send_message("/live/track/set/arm", [i, 0])  # Disarm Player 2's tracks
+    client.send_message("/live/track/set/arm", [track_to_use, 1])  # Arm the selected track
+    client.send_message("/live/clip_slot/fire", [track_to_use, state_tracker.clip_slot_index])
+    state_tracker.mark_track_has_clip(track_to_use, True)
+    
+    # Update the active track for Player 2
+    global current_active_track_player2
+    current_active_track_player2 = track_to_use
+    print(f"Player 2: Recording started on track {track_to_use + 1}, slot {state_tracker.clip_slot_index + 1}")
 
 # --- Connection and Validation Helpers ---
 def verify_ableton_connection(client, timeout=1.0):
@@ -369,16 +430,6 @@ def verify_ableton_connection(client, timeout=1.0):
     else:
         print("Could not verify connection to Ableton. Check that AbletonOSC is running.")
         return False
-
-def validate_state_with_ableton(client, state_tracker):
-    print("Validating internal clip state with Ableton...")
-    for track_idx in [0,2,4,6]:
-        has_clip = check_track_has_clip(client, track_idx, state_tracker.clip_slot_index)
-        state_tracker.mark_track_has_clip(track_idx, has_clip)
-    filled_tracks = [t+1 for t in state_tracker.get_filled_tracks()]
-    empty_tracks  = [t+1 for t in state_tracker.get_empty_tracks()]
-    print(f"Current state - Tracks with clips: {filled_tracks if filled_tracks else 'none'}")
-    print(f"Current state - Empty tracks: {empty_tracks if empty_tracks else 'none'}")
 
 def check_track_has_clip(client, track_index, clip_slot_index):
     print(f"Checking if track {track_index+1}, slot {clip_slot_index+1} has a clip...")
@@ -422,7 +473,7 @@ def update_clip_lengths(client, state_tracker):
         base_clip_length = loop_points[1] - loop_points[0]
         print(f"[INFO] Base clip length: {base_clip_length} beats")
 
-        filled_tracks = state_tracker.get_filled_tracks()
+        filled_tracks = state_tracker.get_filled_tracks(1) + state_tracker.get_filled_tracks(2)
         for track_idx in filled_tracks:
             print(f"Updating loop points for track {track_idx+1} to match length: {base_clip_length} beats")
             client.send_message("/live/clip/set/loop_start", [track_idx, state_tracker.clip_slot_index, 0.0])
@@ -433,23 +484,24 @@ def update_clip_lengths(client, state_tracker):
 # --- Main and Keyboard Handling ---
 def main():
     global running  # Use the global flag
-    global waiting_for_refire, current_active_track, all_clips_recorded
+    global waiting_for_refire_player1, waiting_for_refire_player2, current_active_track_player1, current_active_track_player2, all_clips_recorded
     start_global_osc_server()
-    state_tracker = StateTracker()
+    state_tracker = StateTracker()  # Single StateTracker for both players
     ip = "127.0.0.1"   # AbletonOSC sending address
     port = 11000       # AbletonOSC sending port
     client = udp_client.SimpleUDPClient(ip, port)
-    client2 = udp_client.SimpleUDPClient("192.168.1.10",7001)
+    client2 = udp_client.SimpleUDPClient("192.168.1.10",7001) #maybe add ip_addresses to send to two ips (VR headsets)
     
     print(f"Attempting to connect to AbletonOSC server at {ip}:{port}")
     if not verify_ableton_connection(client):
         input("Press Enter to exit...")
         return
     
-    validate_state_with_ableton(client, state_tracker)
+    # Initial validation for both players
+    state_tracker.validate_state_with_ableton(client)
     ip_addresses = ["192.168.1.10", "192.168.1.11"]  # IP addresses for VR headsets
     state_tracker.start_background_validation(client, ip_addresses)
-    
+
     print("Foot controller started.")
     print("- Press ',' to toggle recording/refiring")
     print("- Press '.' to stop all clips (playback only)")
@@ -459,57 +511,83 @@ def main():
     print("- Press 'esc' to exit")
     
     is_processing = False  # Local to main
+
+    # Add this function to handle incoming messages from client2
+    def handle_incoming_message(unused_addr, *args):
+        # Debug: print the received message
+        print(f"[DEBUG] Incoming message from client2: {args}")
+        
+        # Extract the track and clip information from the message
+        track_clip_info = args[:-1]  # All but the last argument
+        action = args[-1]  # The last part of the message indicates the action (play, pause, delete)
+
+        # Initialize variables to hold track and clip information
+        track_index = None
+        clip_slot_index = None
+
+        # Parse the track and clip information
+        for i in range(len(track_clip_info)):
+            if i % 3 == 0:  # Every first element in the triplet is a track identifier
+                track_index = int(track_clip_info[i][2]) - 1  # Convert 't1' to 0, 't2' to 1, etc.
+                clip_slot_index = int(track_clip_info[i + 1])  # The next element is the clip index
+                break  # We only need the first track and clip for the action
+
+        if track_index is None or clip_slot_index is None:
+            print("[ERROR] Unable to parse track and clip information.")
+            return
+
+        # Send the corresponding command to Ableton based on the action
+        if action == "play":
+            print(f"Playing clip in track {track_index + 1}, slot {clip_slot_index + 1}")
+            client.send_message("/live/clip_slot/fire", [track_index, clip_slot_index])
+        elif action == "pause":
+            print(f"Pausing clip in track {track_index + 1}, slot {clip_slot_index + 1}")
+            client.send_message("/live/clip/stop", [track_index, clip_slot_index])  # Adjust the message as needed
+        elif action == "delete":
+            print(f"Deleting clip in track {track_index + 1}, slot {clip_slot_index + 1}")
+            client.send_message("/live/clip_slot/delete_clip", [track_index, clip_slot_index])  # Adjust the message as needed
+        else:
+            print(f"[ERROR] Unknown action: {action}")
+
+    # Map the incoming OSC messages to the handler
+    global_dispatcher.map("/VROSC/t1/*/*/*/t2/*/*/*/t3/*/*/*/t4/*/*/*/t5/*/*/*/t6/*/*/*/t7/*/*/*/t8/*/*/*", handle_incoming_message)
+
     
     def handle_comma_press(e):
-        nonlocal is_processing
-        global waiting_for_refire, current_active_track, all_clips_recorded
-        with threading.Lock():
-            if is_processing:
-                print("Already processing a command. Please wait...")
-                return
-            is_processing = True
-            try:
-                if waiting_for_refire:
-                    # Second press: re-fire current clip to stop recording.
-                    print(f"Refiring clip in track {current_active_track+1}, slot {state_tracker.clip_slot_index+1} to stop recording.")
-                    client.send_message("/live/clip_slot/fire", [current_active_track, state_tracker.clip_slot_index])
-                    client2.send_message("/sessiontrack",[1,current_active_track])
+        global waiting_for_refire_player1, current_active_track_player1, all_clips_recorded, is_processing_player1
+        print("Player 1: Comma key pressed.")
+        
+        if is_processing_player1:
+            print("Player 1 is already processing a command. Please wait...")
+            return
 
-                    
-                    # Finalize the recording in a background thread.
-                    threading.Thread(
-                        target=finalize_recording, 
-                        args=(client, current_active_track, state_tracker.clip_slot_index, state_tracker), 
-                        daemon=True
-                    ).start()
-                    
-                    # Arm the next track in the series
-                    next_track = state_tracker.get_next_track(current_active_track)
-                    client.send_message("/live/track/set/arm", [next_track, 1])  # Arm the next track
-                    print(f"Next track {next_track+1} armed for recording.")
-                    
-                    waiting_for_refire = False
-                else:
-                    # Reset sync flag when starting a new recording session
-                    if all_clips_recorded:
-                        all_clips_recorded = False
-                    
-                    # First or third press: record a new clip.
-                    track_to_use = state_tracker.get_next_empty_track()
-                    if track_to_use is None:
-                        print("All designated tracks (1, 3, 5, 7) are full! Clear some clips before recording more.")
-                        client2.send_message("/sessiontrack",["all tracks full"])
+        is_processing_player1 = True
+        try:
+            if waiting_for_refire_player1:
+                print(f"Player 1: Refiring clip in track {current_active_track_player1 + 1}, slot {state_tracker.clip_slot_index + 1} to stop recording.")
+                client.send_message("/live/clip_slot/fire", [current_active_track_player1, state_tracker.clip_slot_index])
+                client2.send_message("/sessiontrack", [1, current_active_track_player1])
 
-                        return
-                    
-                    print(f"Recording new clip in track {track_to_use+1}, slot {state_tracker.clip_slot_index+1}")
-                    record_clip(client, track_to_use, state_tracker.clip_slot_index, state_tracker)
-                    client2.send_message("/sessiontrack",[1,track_to_use])
+                threading.Thread(
+                    target=finalize_recording,
+                    args=(client, current_active_track_player1, state_tracker.clip_slot_index, state_tracker),
+                    daemon=True
+                ).start()
 
-                    current_active_track = track_to_use
-                    waiting_for_refire = True
-            finally:
-                is_processing = False
+                next_track = state_tracker.get_next_track(current_active_track_player1, 1)
+                client.send_message("/live/track/set/arm", [next_track, 1])
+                print(f"Player 1: Next track {next_track + 1} armed for recording.")
+                waiting_for_refire_player1 = False
+            else:
+                if all_clips_recorded:
+                    all_clips_recorded = False
+
+                record_clip_player1(client, state_tracker)
+                client2.send_message("/sessiontrack", [1, current_active_track_player1])
+                current_active_track_player1 = current_active_track_player1
+                waiting_for_refire_player1 = True
+        finally:
+            is_processing_player1 = False
     
     def stop_clips(e):
         print("Stopping all clips (playback only)...")
@@ -524,7 +602,7 @@ def main():
             is_processing = True
             try:
                 print("Forcing state validation with Ableton...")
-                validate_state_with_ableton(client, state_tracker)
+                state_tracker.validate_state_with_ableton(client)
             finally:
                 is_processing = False
     
@@ -560,13 +638,56 @@ def main():
     keyboard.on_press_key('down', handle_down_press)
     keyboard.on_press_key('esc', stop_program)  # Listen for the escape key
     
+    # Add this function to handle Player 2's comma press (equivalent to Player 1's comma)
+    def handle_semicolon_press(e):
+        global waiting_for_refire_player2, current_active_track_player2, all_clips_recorded, is_processing_player2
+        print("Player 2: Semicolon key pressed.")
+        
+        if is_processing_player2:
+            print("Player 2 is already processing a command. Please wait...")
+            return
+
+        is_processing_player2 = True
+        try:
+            if waiting_for_refire_player2:
+                print(f"Player 2: Refiring clip in track {current_active_track_player2 + 1}, slot {state_tracker.clip_slot_index + 1} to stop recording.")
+                client.send_message("/live/clip_slot/fire", [current_active_track_player2, state_tracker.clip_slot_index])
+                client2.send_message("/sessiontrack", [2, current_active_track_player2])
+
+                threading.Thread(
+                    target=finalize_recording,
+                    args=(client, current_active_track_player2, state_tracker.clip_slot_index, state_tracker),
+                    daemon=True
+                ).start()
+
+                next_track = state_tracker.get_next_track(current_active_track_player2, 2) + 1
+                client.send_message("/live/track/set/arm", [next_track, 1])
+                print(f"Player 2: Next track {next_track + 1} armed for recording.")
+                waiting_for_refire_player2 = False
+            else:
+                if all_clips_recorded:
+                    all_clips_recorded = False
+
+                record_clip_player2(client, state_tracker)
+                client2.send_message("/sessiontrack", [2, current_active_track_player2])
+                current_active_track_player2 = current_active_track_player2
+                waiting_for_refire_player2 = True
+        finally:
+            is_processing_player2 = False
+
+    # Map the new keyboard presses for Player 2
+    keyboard.on_press_key(';', handle_semicolon_press)  # Equivalent to Player 1's comma
+    keyboard.on_press_key("'", stop_clips)  # Equivalent to Player 1's stop clips
+    keyboard.on_press_key('\\', force_validation)  # Equivalent to Player 1's force validation
+    keyboard.on_press_key('s', sync_all_clips)  # Equivalent to Player 1's sync
+
     # Start periodic updates
     def periodic_update():
         if running:  # Check if the program should continue running
             update_clip_lengths(client, state_tracker)
             threading.Timer(5.0, periodic_update).start()  # Check every 5 seconds
         else:
-            state_tracker.stop_background_validation()  # Stop any background validation
+            state_tracker.stop_background_validation()
             if global_osc_server:
                 global_osc_server.shutdown()  # Shutdown the OSC server
 
@@ -577,6 +698,7 @@ def main():
         time.sleep(0.1)  # Sleep briefly to avoid busy waiting
 
     print("Foot controller has stopped.")
+
 
 if __name__ == "__main__":
     main()
