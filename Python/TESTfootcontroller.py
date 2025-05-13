@@ -155,7 +155,7 @@ class StateTracker:
         """
         grid = self.get_clip_presence_grid(client2)
         for ip in ip_addresses:
-            message = f"VROSC/t1/{grid[0]}/{grid[1]}/{grid[2]}/t2/{grid[3]}/{grid[4]}/{grid[5]}/t3/{grid[6]}/{grid[7]}/{grid[8]}/t4/{grid[9]}/{grid[10]}/{grid[11]}/t5/{grid[12]}/{grid[13]}/{grid[14]}/t6/{grid[15]}/{grid[16]}/{grid[17]}/t7/{grid[18]}/{grid[19]}/{grid[20]}/t8/{grid[21]}/{grid[22]}/{grid[23]}"
+            message = f"/VROSC/t1/{grid[0]}/{grid[1]}/{grid[2]}/t2/{grid[3]}/{grid[4]}/{grid[5]}/t3/{grid[6]}/{grid[7]}/{grid[8]}/t4/{grid[9]}/{grid[10]}/{grid[11]}/t5/{grid[12]}/{grid[13]}/{grid[14]}/t6/{grid[15]}/{grid[16]}/{grid[17]}/t7/{grid[18]}/{grid[19]}/{grid[20]}/t8/{grid[21]}/{grid[22]}/{grid[23]}"
             client2.send_message(message, [])
             print(f"Sent OSC message to {ip}: {message}")
 
@@ -490,7 +490,7 @@ def main():
     ip = "127.0.0.1"   # AbletonOSC sending address
     port = 11000       # AbletonOSC sending port
     client = udp_client.SimpleUDPClient(ip, port)
-    client2 = udp_client.SimpleUDPClient("192.168.1.10",7001) #maybe add ip_addresses to send to two ips (VR headsets)
+    client2 = udp_client.SimpleUDPClient("255.255.255.255", 9000) #broadcast mode for VR headsets
     
     print(f"Attempting to connect to AbletonOSC server at {ip}:{port}")
     if not verify_ableton_connection(client):
@@ -499,7 +499,7 @@ def main():
     
     # Initial validation for both players
     state_tracker.validate_state_with_ableton(client)
-    ip_addresses = ["192.168.1.10", "192.168.1.11"]  # IP addresses for VR headsets
+    ip_addresses = ["255.255.255.255"]  # Broadcast address for VR headsets
     state_tracker.start_background_validation(client, ip_addresses)
 
     print("Foot controller started.")
