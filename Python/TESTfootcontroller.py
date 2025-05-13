@@ -3,6 +3,7 @@
 ## needs to consider main functions associated with Unity interaction (e.g. play, pause, delete tracks) * added not tested, need launch session
 # retains double arming after recording a clip. just messy if playing without recording, but nbd
 # there is redundancy in the state_tracker that is worth optimizing
+# scene fire not working
  
 from pythonosc import udp_client, dispatcher, osc_server
 import time
@@ -490,7 +491,7 @@ def main():
     ip = "127.0.0.1"   # AbletonOSC sending address
     port = 11000       # AbletonOSC sending port
     client = udp_client.SimpleUDPClient(ip, port)
-    client2 = udp_client.SimpleUDPClient("255.255.255.255", 9000) #broadcast mode for VR headsets
+    client2 = udp_client.SimpleUDPClient("255.255.255.255",9000) #maybe add ip_addresses to send to two ips (VR headsets)
     
     print(f"Attempting to connect to AbletonOSC server at {ip}:{port}")
     if not verify_ableton_connection(client):
@@ -499,7 +500,7 @@ def main():
     
     # Initial validation for both players
     state_tracker.validate_state_with_ableton(client)
-    ip_addresses = ["255.255.255.255"]  # Broadcast address for VR headsets
+    ip_addresses = ["255.255.255.255"]  # IP addresses for VR headsets
     state_tracker.start_background_validation(client, ip_addresses)
 
     print("Foot controller started.")
@@ -552,7 +553,15 @@ def main():
     # Map the incoming OSC messages to the handler
     global_dispatcher.map("/VROSC/t1/*/*/*/t2/*/*/*/t3/*/*/*/t4/*/*/*/t5/*/*/*/t6/*/*/*/t7/*/*/*/t8/*/*/*", handle_incoming_message)
 
-    
+    def fire_scene(client, scene_index):
+        """
+        Fires the specified scene in Ableton.
+        """
+        print(f"Firing Scene {scene_index + 1}...")
+        client.send_message("/live/scene/fire", [scene_index])
+        print(f"Sent OSC message: /live/scene/fire [{scene_index}]")
+
+
     def handle_comma_press(e):
         global waiting_for_refire_player1, current_active_track_player1, all_clips_recorded, is_processing_player1
         print("Player 1: Comma key pressed.")
@@ -632,7 +641,6 @@ def main():
     
     keyboard.on_press_key(',', handle_comma_press)
     keyboard.on_press_key('.', stop_clips)
-    keyboard.on_press_key('/', force_validation)
     keyboard.on_press_key('s', sync_all_clips)  # Manual synchronization shortcut
     keyboard.on_press_key('up', handle_up_press)
     keyboard.on_press_key('down', handle_down_press)
@@ -678,8 +686,8 @@ def main():
     # Map the new keyboard presses for Player 2
     keyboard.on_press_key(';', handle_semicolon_press)  # Equivalent to Player 1's comma
     keyboard.on_press_key("'", stop_clips)  # Equivalent to Player 1's stop clips
-    keyboard.on_press_key('\\', force_validation)  # Equivalent to Player 1's force validation
-    keyboard.on_press_key('s', sync_all_clips)  # Equivalent to Player 1's sync
+    keyboard.on_press_key('\\', lambda e: fire_scene(client, 0))  # Fire Scene 1 for Player 1
+    keyboard.on_press_key('/', lambda e: fire_scene(client, 0))   # Fire Scene 1 for Player 2
 
     # Start periodic updates
     def periodic_update():
