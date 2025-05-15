@@ -1,7 +1,8 @@
 ####Issues outstanding#####
 ## needs OSC messages added to control Unity *some added
 ## needs to consider main functions associated with Unity interaction (e.g. play, pause, delete tracks) * added not tested, need launch session
-# retains double arming after recording a clip. just messy if playing without recording, but nbd
+# there is redundancy in the state_tracker that is worth optimizing
+# 255.255.255.255 port 9000 bricks the code without permissions
  
 from pythonosc import udp_client, dispatcher, osc_server
 import time
@@ -25,6 +26,10 @@ running = True
 # Add separate processing flags for each player
 is_processing_player1 = False
 is_processing_player2 = False
+
+# Add thread locks for each player
+player1_lock = threading.Lock()
+player2_lock = threading.Lock()
 
 def start_global_osc_server():
     global global_osc_server
@@ -154,7 +159,7 @@ class StateTracker:
         """
         grid = self.get_clip_presence_grid(client2)
         for ip in ip_addresses:
-            message = f"VROSC/t1/{grid[0]}/{grid[1]}/{grid[2]}/t2/{grid[3]}/{grid[4]}/{grid[5]}/t3/{grid[6]}/{grid[7]}/{grid[8]}/t4/{grid[9]}/{grid[10]}/{grid[11]}/t5/{grid[12]}/{grid[13]}/{grid[14]}/t6/{grid[15]}/{grid[16]}/{grid[17]}/t7/{grid[18]}/{grid[19]}/{grid[20]}/t8/{grid[21]}/{grid[22]}/{grid[23]}"
+            message = f"/VROSC/t1/{grid[0]}/{grid[1]}/{grid[2]}/t2/{grid[3]}/{grid[4]}/{grid[5]}/t3/{grid[6]}/{grid[7]}/{grid[8]}/t4/{grid[9]}/{grid[10]}/{grid[11]}/t5/{grid[12]}/{grid[13]}/{grid[14]}/t6/{grid[15]}/{grid[16]}/{grid[17]}/t7/{grid[18]}/{grid[19]}/{grid[20]}/t8/{grid[21]}/{grid[22]}/{grid[23]}"
             client2.send_message(message, [])
             print(f"Sent OSC message to {ip}: {message}")
 
@@ -277,20 +282,12 @@ def initialize_base_clip_length(client, state_tracker):
 
 # --- Finalizing Recording ---
 def finalize_recording(client, track_index, clip_slot_index, state_tracker):
-    """
-    After a recording has been stopped by re-firing the clip, this function waits and
-    polls repeatedly for valid loop start and end points.
-    • If the finalized clip is the first clip (track 1, slot 1) and base_clip_length is unset,
-      it updates base_clip_length.
-    • It checks if all tracks are now filled, and if so, triggers the synchronization.
-    """
     global base_clip_length, all_clips_recorded
     print(f"[DEBUG] Finalizing recording on track {track_index+1}, slot {clip_slot_index+1}...")
-    
-    # Wait for the clip to be properly loaded after recording
+
     time.sleep(1.0)
-    
-    max_attempts = 20  # Poll up to 20 times (e.g., 10 seconds with a 0.5-second interval)
+
+    max_attempts = 20
     attempt = 0
     loop_points = [None, None]
     while attempt < max_attempts:
@@ -299,31 +296,31 @@ def finalize_recording(client, track_index, clip_slot_index, state_tracker):
             break
         attempt += 1
         time.sleep(0.5)
-    
+
     print(f"[DEBUG] Final loop points for track {track_index+1}, slot {clip_slot_index+1}: {loop_points}")
-    
+
     if loop_points[0] is not None and loop_points[1] is not None:
         clip_length = loop_points[1] - loop_points[0]
-        
-        # If this is the first clip, set the base clip length
+
+        # Mark finalized track as having a clip
+        state_tracker.mark_track_has_clip(track_index, True)
+
         if base_clip_length is None and track_index == 0 and clip_slot_index == 0:
             base_clip_length = clip_length
             print(f"[DEBUG] Base clip length updated to {base_clip_length} beats (from first clip).")
         elif base_clip_length is not None and clip_length < base_clip_length:
-            # Update base_clip_length only if the new clip length is shorter
             base_clip_length = clip_length
             print(f"[DEBUG] Base clip length updated to {base_clip_length} beats (from subsequent clip).")
-        
-        # Check if all designated tracks now have clips
+
         if state_tracker.are_all_tracks_filled(1) or state_tracker.are_all_tracks_filled(2):
             print("[DEBUG] All designated tracks now have clips. Starting synchronization after delay...")
             all_clips_recorded = True
-            # Use a timer to allow a moment for final processing
             update_timer = threading.Timer(2.0, update_all_clips_loop_points, args=(client, state_tracker))
             update_timer.daemon = True
             update_timer.start()
     else:
         print("[DEBUG] Unable to capture loop point values after finalization.")
+
 
 # --- Update All Clips Loop Points ---
 def update_all_clips_loop_points(client, state_tracker):
@@ -489,7 +486,7 @@ def main():
     ip = "127.0.0.1"   # AbletonOSC sending address
     port = 11000       # AbletonOSC sending port
     client = udp_client.SimpleUDPClient(ip, port)
-    client2 = udp_client.SimpleUDPClient("192.168.1.10",7001) #maybe add ip_addresses to send to two ips (VR headsets)
+    client2 = udp_client.SimpleUDPClient("192.168.0.1",1000) #maybe add ip_addresses to send to two ips (VR headsets)
     
     print(f"Attempting to connect to AbletonOSC server at {ip}:{port}")
     if not verify_ableton_connection(client):
@@ -498,13 +495,14 @@ def main():
     
     # Initial validation for both players
     state_tracker.validate_state_with_ableton(client)
-    ip_addresses = ["192.168.1.10", "192.168.1.11"]  # IP addresses for VR headsets
+    ip_addresses = ["255.255.255.255"]  # IP addresses for VR headsets
     state_tracker.start_background_validation(client, ip_addresses)
 
-    print("Foot controller started.")
+    print("Foot controller started. Player 1 controls")
     print("- Press ',' to toggle recording/refiring")
     print("- Press '.' to stop all clips (playback only)")
-    print("- Press '/' to force state validation with Ableton")
+    print("- Press '/' to fire scene")
+    print("- Player 2 press ; ' \ to do same thing")
     print("- Press 's' to synchronize all clips to the same length")
     print("- Press 'up' and 'down' for other controls (not used here)")
     print("- Press 'esc' to exit")
@@ -551,59 +549,180 @@ def main():
     # Map the incoming OSC messages to the handler
     global_dispatcher.map("/VROSC/t1/*/*/*/t2/*/*/*/t3/*/*/*/t4/*/*/*/t5/*/*/*/t6/*/*/*/t7/*/*/*/t8/*/*/*", handle_incoming_message)
 
-    
-    def handle_comma_press(e):
-        global waiting_for_refire_player1, current_active_track_player1, all_clips_recorded, is_processing_player1
-        print("Player 1: Comma key pressed.")
-        
-        if is_processing_player1:
-            print("Player 1 is already processing a command. Please wait...")
-            return
 
-        is_processing_player1 = True
+
+    def handle_comma_press(e):
+        global waiting_for_refire_player1, current_active_track_player1, is_processing_player1
+
+        print("[DEBUG] --- Comma Key Pressed ---")
+        print(f"[DEBUG] PRE: waiting_for_refire_player1={waiting_for_refire_player1}, current_active_track_player1={current_active_track_player1}, is_processing_player1={is_processing_player1}")
+        print("Player 1: Comma key pressed.")
+
+        with player1_lock:
+            if is_processing_player1:
+                print("Player 1: Already processing.")
+                return
+            is_processing_player1 = True
+
         try:
             if waiting_for_refire_player1:
-                print(f"Player 1: Refiring clip in track {current_active_track_player1 + 1}, slot {state_tracker.clip_slot_index + 1} to stop recording.")
+                print(f"Player 1: Stopping track {current_active_track_player1 + 1}")
                 client.send_message("/live/clip_slot/fire", [current_active_track_player1, state_tracker.clip_slot_index])
                 client2.send_message("/sessiontrack", [1, current_active_track_player1])
 
+                finalized_track = current_active_track_player1
+                next_track = state_tracker.get_next_track(current_active_track_player1, 1)
+
+                for i in [0, 2, 4, 6]:
+                    client.send_message("/live/track/set/arm", [i, 0])
+                client.send_message("/live/track/set/arm", [next_track, 1])
+                print(f"Player 1: Armed next track {next_track + 1}")
+
+                with player1_lock:
+                    current_active_track_player1 = next_track
+                    waiting_for_refire_player1 = False
+                    print("[DEBUG] Player 1: Set waiting_for_refire_player1 = False")
+
                 threading.Thread(
-                    target=finalize_recording,
-                    args=(client, current_active_track_player1, state_tracker.clip_slot_index, state_tracker),
+                target=finalize_recording,
+                args=(client, finalized_track, state_tracker.clip_slot_index, state_tracker),
                     daemon=True
                 ).start()
-
-                next_track = state_tracker.get_next_track(current_active_track_player1, 1)
-                client.send_message("/live/track/set/arm", [next_track, 1])
-                print(f"Player 1: Next track {next_track + 1} armed for recording.")
-                waiting_for_refire_player1 = False
             else:
-                if all_clips_recorded:
-                    all_clips_recorded = False
+                if current_active_track_player1 is None:
+                    current_active_track_player1 = state_tracker.get_next_empty_track(1)
+                    client.send_message("/live/track/set/arm",[8,1])
+                    if current_active_track_player1 is None:
+                        print("Player 1: No available tracks.")
+                        return
 
-                record_clip_player1(client, state_tracker)
+                print(f"Player 1: Starting recording on track {current_active_track_player1 + 1}")
+
+                for i in [0, 2, 4, 6]:
+                    client.send_message("/live/track/set/arm", [i, 0])
+                client.send_message("/live/track/set/arm", [current_active_track_player1, 1])
+                client.send_message("/live/clip_slot/fire", [current_active_track_player1, state_tracker.clip_slot_index])
                 client2.send_message("/sessiontrack", [1, current_active_track_player1])
-                current_active_track_player1 = current_active_track_player1
-                waiting_for_refire_player1 = True
+
+                with player1_lock:
+                    waiting_for_refire_player1 = True
+                    print("[DEBUG] Player 1: Set waiting_for_refire_player1 = True")
+        except Exception as e:
+            print(f"ERROR in Player 1: {e}")
+            with player1_lock:
+                waiting_for_refire_player1 = False
         finally:
-            is_processing_player1 = False
+            with player1_lock:
+                is_processing_player1 = False
+                print(f"[DEBUG] POST: waiting_for_refire_player1={waiting_for_refire_player1}, current_active_track_player1={current_active_track_player1}, is_processing_player1={is_processing_player1}")
+
+    def handle_semicolon_press(e):
+        global waiting_for_refire_player2, current_active_track_player2, is_processing_player2
+        print("[DEBUG] --- Semicolon Key Pressed ---")
+        print(f"[DEBUG] PRE: waiting_for_refire_player2={waiting_for_refire_player2}, current_active_track_player2={current_active_track_player2}, is_processing_player2={is_processing_player2}")
+        print("Player 2: Semicolon key pressed.")
+
+        with player2_lock:
+            if is_processing_player2:
+                print("Player 2: Already processing.")
+                return
+            is_processing_player2 = True
+
+        try:
+            if waiting_for_refire_player2:
+                print(f"Player 2: Stopping track {current_active_track_player2 + 1}")
+                client.send_message("/live/clip_slot/fire", [current_active_track_player2, state_tracker.clip_slot_index])
+                client2.send_message("/sessiontrack", [2, current_active_track_player2])
+
+                finalized_track = current_active_track_player2
+                next_track = state_tracker.get_next_track(current_active_track_player2, 2)
+
+                for i in [1, 3, 5, 7]:
+                    client.send_message("/live/track/set/arm", [i, 0])
+                client.send_message("/live/track/set/arm", [next_track, 1])
+                print(f"Player 2: Armed next track {next_track + 1}")
+
+                with player2_lock:
+                    current_active_track_player2 = next_track
+                    waiting_for_refire_player2 = False
+                    print("[DEBUG] Player 2: Set waiting_for_refire_player2 = False")
+
+                threading.Thread(
+                target=finalize_recording,
+                args=(client, finalized_track, state_tracker.clip_slot_index, state_tracker),
+                    daemon=True
+                ).start()
+            else:
+                if current_active_track_player2 is None:
+                    current_active_track_player2 = state_tracker.get_next_empty_track(2)
+                    client.send_message("/live/track/set/arm",[9,1])
+
+                    if current_active_track_player2 is None:
+                        print("Player 2: No available tracks.")
+                        return
+
+                print(f"Player 2: Starting recording on track {current_active_track_player2 + 1}")
+
+                for i in [1, 3, 5, 7]:
+                    client.send_message("/live/track/set/arm", [i, 0])
+                client.send_message("/live/track/set/arm", [current_active_track_player2, 1])
+                client.send_message("/live/clip_slot/fire", [current_active_track_player2, state_tracker.clip_slot_index])
+                client2.send_message("/sessiontrack", [2, current_active_track_player2])
+
+                with player2_lock:
+                    waiting_for_refire_player2 = True
+                    print("[DEBUG] Player 2: Set waiting_for_refire_player2 = True")
+        except Exception as e:
+            print(f"ERROR in Player 2: {e}")
+            with player2_lock:
+                waiting_for_refire_player2 = False
+        finally:
+            with player2_lock:
+                is_processing_player2 = False
+                print(f"[DEBUG] POST: waiting_for_refire_player2={waiting_for_refire_player2}, current_active_track_player2={current_active_track_player2}, is_processing_player2={is_processing_player2}")
+
+
+    def fire_scene(e):
+        """
+        Fires the specified scene in Ableton.
+        """
+        print("fire message sent for scene")
+
+        for i in range(8):
+            client.send_message("/live/clip_slot/fire",[i,0])
+
+        # not working in ableton osc for some reason
+        # print(f"Firing Scene {scene_index + 1}...")
+        # client.send_message("/live/scene/fire", [scene_index])
+        # print(f"Sent OSC message: /live/scene/fire [{scene_index}]")
     
+    def handle_up_press(e):
+        print("Up key pressed (no loop action)")
+    
+    def handle_down_press(e):
+        print("Down key pressed (no loop action)")
+    
+    def stop_program(e):
+        global running
+        print("Exiting foot controller...")
+        running = False  # Set the flag to False to stop the program
+
     def stop_clips(e):
         print("Stopping all clips (playback only)...")
         client.send_message("/live/song/stop_all_clips", [])
     
-    def force_validation(e):
-        nonlocal is_processing
-        with threading.Lock():
-            if is_processing:
-                print("Already processing a command. Please wait...")
-                return
-            is_processing = True
-            try:
-                print("Forcing state validation with Ableton...")
-                state_tracker.validate_state_with_ableton(client)
-            finally:
-                is_processing = False
+    # def force_validation(e):
+    #     nonlocal is_processing
+    #     with threading.Lock():
+    #         if is_processing:
+    #             print("Already processing a command. Please wait...")
+    #             return
+    #         is_processing = True
+    #         try:
+    #             print("Forcing state validation with Ableton...")
+    #             validate_state_with_ableton(client, state_tracker)
+    #         finally:
+    #             is_processing = False
     
     def sync_all_clips(e):
         nonlocal is_processing
@@ -617,68 +736,21 @@ def main():
                 update_all_clips_loop_points(client, state_tracker)
             finally:
                 is_processing = False
-    
-    def handle_up_press(e):
-        print("Up key pressed (no loop action)")
-    
-    def handle_down_press(e):
-        print("Down key pressed (no loop action)")
-    
-    def stop_program(e):
-        global running
-        print("Exiting foot controller...")
-        running = False  # Set the flag to False to stop the program
-    
+        
+    # Fix keyboard bindings
     keyboard.on_press_key(',', handle_comma_press)
     keyboard.on_press_key('.', stop_clips)
-    keyboard.on_press_key('/', force_validation)
-    keyboard.on_press_key('s', sync_all_clips)  # Manual synchronization shortcut
+    #keyboard.on_press_key('/', force_validation)
+    keyboard.on_press_key('s', sync_all_clips)
     keyboard.on_press_key('up', handle_up_press)
     keyboard.on_press_key('down', handle_down_press)
-    keyboard.on_press_key('esc', stop_program)  # Listen for the escape key
+    keyboard.on_press_key('esc', stop_program)
     
-    # Add this function to handle Player 2's comma press (equivalent to Player 1's comma)
-    def handle_semicolon_press(e):
-        global waiting_for_refire_player2, current_active_track_player2, all_clips_recorded, is_processing_player2
-        print("Player 2: Semicolon key pressed.")
-        
-        if is_processing_player2:
-            print("Player 2 is already processing a command. Please wait...")
-            return
-
-        is_processing_player2 = True
-        try:
-            if waiting_for_refire_player2:
-                print(f"Player 2: Refiring clip in track {current_active_track_player2 + 1}, slot {state_tracker.clip_slot_index + 1} to stop recording.")
-                client.send_message("/live/clip_slot/fire", [current_active_track_player2, state_tracker.clip_slot_index])
-                client2.send_message("/sessiontrack", [2, current_active_track_player2])
-
-                threading.Thread(
-                    target=finalize_recording,
-                    args=(client, current_active_track_player2, state_tracker.clip_slot_index, state_tracker),
-                    daemon=True
-                ).start()
-
-                next_track = state_tracker.get_next_track(current_active_track_player2, 2) + 1
-                client.send_message("/live/track/set/arm", [next_track, 1])
-                print(f"Player 2: Next track {next_track + 1} armed for recording.")
-                waiting_for_refire_player2 = False
-            else:
-                if all_clips_recorded:
-                    all_clips_recorded = False
-
-                record_clip_player2(client, state_tracker)
-                client2.send_message("/sessiontrack", [2, current_active_track_player2])
-                current_active_track_player2 = current_active_track_player2
-                waiting_for_refire_player2 = True
-        finally:
-            is_processing_player2 = False
-
-    # Map the new keyboard presses for Player 2
-    keyboard.on_press_key(';', handle_semicolon_press)  # Equivalent to Player 1's comma
-    keyboard.on_press_key("'", stop_clips)  # Equivalent to Player 1's stop clips
-    keyboard.on_press_key('\\', force_validation)  # Equivalent to Player 1's force validation
-    keyboard.on_press_key('s', sync_all_clips)  # Equivalent to Player 1's sync
+    # Map the Player 2 keyboard presses
+    keyboard.on_press_key(';', handle_semicolon_press)
+    keyboard.on_press_key("'", stop_clips)
+    keyboard.on_press_key('backslash', fire_scene)  # Fire Scene 1 for Player 1
+    keyboard.on_press_key('/', fire_scene)   # Fire Scene 1 for Player 2
 
     # Start periodic updates
     def periodic_update():
@@ -698,6 +770,12 @@ def main():
 
     print("Foot controller has stopped.")
 
+# Function to safely print debug info
+def debug_print_state():
+    print("\n--- CURRENT STATE ---")
+    print(f"Player 1: waiting_for_refire={waiting_for_refire_player1}, track={current_active_track_player1}, processing={is_processing_player1}")
+    print(f"Player 2: waiting_for_refire={waiting_for_refire_player2}, track={current_active_track_player2}, processing={is_processing_player2}")
+    print("--------------------\n")
 
 if __name__ == "__main__":
     main()
