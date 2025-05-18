@@ -35,23 +35,25 @@ player1_lock = threading.Lock()
 player2_lock = threading.Lock()
 
 client = None  # global client variable
-client2 = None
+client2_clients = []  # List of UDP clients for VR headsets
 
+# Helper function to send to all client2 addresses
+def send_to_all_client2_clients(clients, address, args):
+    for c in clients:
+        c.send_message(address, args)
 
-def fire_scene(client, e=None):
+def fire_scene(client, client2_clients, e=None):
     print("fire message sent for scene (only firing unarmed tracks)")
-    if client2 is not None:
-        client2.send_message("/pcplayall", [True])
+    send_to_all_client2_clients(client2_clients, "/pcplayall", [True])
     for i in range(8):
         client.send_message("/live/clip_slot/fire", [i, 0])
 
-def stop_clips(client, e=None):
+def stop_clips(client, client2_clients, e=None):
     print("Stopping all clips (playback only)...")
-    if client2 is not None:
-        client2.send_message("/pcplayall", [False])
+    send_to_all_client2_clients(client2_clients, "/pcplayall", [False])
     client.send_message("/live/song/stop_all_clips", [])
 
-def delete_scene(client, e=None):
+def delete_scene(client, client2_clients, e=None):
     print("fire message sent for scene")
     for i in range(8):
         client.send_message("/live/clip_slot/delete_clip", [i, 0])
@@ -97,7 +99,7 @@ def start_global_osc_server():
     return thread
 
 
-def start_client2_osc_server(client):
+def start_client2_osc_server(client, client2_clients):
     global client2_osc_server, client2_dispatcher
     client2_ip = "0.0.0.0"
     client2_port = 12000
@@ -107,14 +109,9 @@ def start_client2_osc_server(client):
         print(f"Client2 OSC server already running on {client2_ip}:{client2_port}")
         return
 
-    # Use the global dispatcher
     client2_dispatcher = dispatcher.Dispatcher()
-    client2_dispatcher.map("/playall", lambda addr, *args: fire_scene(client, None) if args[0] else stop_clips(client, None))
-    
-    #Delete all tracks
-    client2_dispatcher.map("/deleteall", lambda addr, *args: delete_scene(client, None))
-
-    #toggle tracks player 1 = /toggletrack/Player1/Track1/true or false
+    client2_dispatcher.map("/playall", lambda addr, *args: fire_scene(client, client2_clients, None) if args[0] else stop_clips(client, client2_clients, None))
+    client2_dispatcher.map("/deleteall", lambda addr, *args: delete_scene(client, client2_clients, None))
     client2_dispatcher.map("/toggletrack/*/*/*", lambda addr, *args: handle_toggletrack(client, addr, *args))
 
     client2_osc_server = osc_server.ThreadingOSCUDPServer((client2_ip, client2_port), client2_dispatcher)
@@ -563,15 +560,15 @@ def update_clip_lengths(client, state_tracker):
 def main():
     global running  # Use the global flag
     global waiting_for_refire_player1, waiting_for_refire_player2, current_active_track_player1, current_active_track_player2, all_clips_recorded
-    global client2
+    global client2_clients
     start_global_osc_server()
     state_tracker = StateTracker()  # Single StateTracker for both players
     ip = "127.0.0.1"   # AbletonOSC sending address
     port = 11000       # AbletonOSC sending port
     client = udp_client.SimpleUDPClient(ip, port)
-    #client2 = udp_client.SimpleUDPClient("192.168.0.1",1000) #maybe add ip_addresses to send to two ips (VR headsets)
-    client2 = udp_client.SimpleUDPClient("192.168.1.255",9000) #maybe add ip_addresses to send to two ips (VR headsets)
-    start_client2_osc_server(client)
+    ip_addresses = ["192.168.1.28","192.168.1.10"]  # IP addresses for VR headsets
+    client2_clients = [udp_client.SimpleUDPClient(ip, 9000) for ip in ip_addresses]
+    start_client2_osc_server(client, client2_clients)
     
     print(f"Attempting to connect to AbletonOSC server at {ip}:{port}")
     if not verify_ableton_connection(client):
@@ -580,7 +577,7 @@ def main():
     
     # Initial validation for both players
     state_tracker.validate_state_with_ableton(client)
-    ip_addresses = ["255.255.255.255"]  # IP addresses for VR headsets
+    ip_addresses = ["192.168.1.28","192.168.1.10"]  # IP addresses for VR headsets
     state_tracker.start_background_validation(client, ip_addresses)
 
     print("Foot controller started. Player 1 controls")
@@ -612,8 +609,8 @@ def main():
             if waiting_for_refire_player1:
                 print(f"Player 1: Stopping track {current_active_track_player1 + 1}")
                 client.send_message("/live/clip_slot/fire", [current_active_track_player1, state_tracker.clip_slot_index])
-                client2.send_message("/playertrack", [1, current_active_track_player1])
-                client2.send_message("/clipisrecording", [1, current_active_track_player1, False])
+                send_to_all_client2_clients(client2_clients, "/playertrack", [1, current_active_track_player1])
+                send_to_all_client2_clients(client2_clients, "/clipisrecording", [1, current_active_track_player1, False])
                 print("/clipisrecording", [1, current_active_track_player1, False])
 
                 finalized_track = current_active_track_player1
@@ -648,8 +645,8 @@ def main():
                     client.send_message("/live/track/set/arm", [i, 0])
                 client.send_message("/live/track/set/arm", [current_active_track_player1, 1])
                 client.send_message("/live/clip_slot/fire", [current_active_track_player1, state_tracker.clip_slot_index])
-                client2.send_message("/playertrack", [1, current_active_track_player1])
-                client2.send_message("/clipisrecording", [1, current_active_track_player1, True])
+                send_to_all_client2_clients(client2_clients, "/playertrack", [1, current_active_track_player1])
+                send_to_all_client2_clients(client2_clients, "/clipisrecording", [1, current_active_track_player1, True])
                 print("/clipisrecording", [1, current_active_track_player1, True])
 
                 with player1_lock:
@@ -680,8 +677,8 @@ def main():
             if waiting_for_refire_player2:
                 print(f"Player 2: Stopping track {current_active_track_player2 + 1}")
                 client.send_message("/live/clip_slot/fire", [current_active_track_player2, state_tracker.clip_slot_index])
-                client2.send_message("/playertrack", [2, current_active_track_player2])
-                client2.send_message("/clipisrecording", [2, current_active_track_player2, False])
+                send_to_all_client2_clients(client2_clients, "/playertrack", [2, current_active_track_player2])
+                send_to_all_client2_clients(client2_clients, "/clipisrecording", [2, current_active_track_player2, False])
 
                 finalized_track = current_active_track_player2
                 next_track = state_tracker.get_next_track(current_active_track_player2, 2)
@@ -716,8 +713,8 @@ def main():
                     client.send_message("/live/track/set/arm", [i, 0])
                 client.send_message("/live/track/set/arm", [current_active_track_player2, 1])
                 client.send_message("/live/clip_slot/fire", [current_active_track_player2, state_tracker.clip_slot_index])
-                client2.send_message("/playertrack", [2, current_active_track_player2])
-                client2.send_message("/clipisrecording", [2, current_active_track_player2, True])
+                send_to_all_client2_clients(client2_clients, "/playertrack", [2, current_active_track_player2])
+                send_to_all_client2_clients(client2_clients, "/clipisrecording", [2, current_active_track_player2, True])
 
                 with player2_lock:
                     waiting_for_refire_player2 = True
@@ -767,20 +764,15 @@ def main():
         
     # Fix keyboard bindings
     keyboard.on_press_key(',', handle_comma_press)
-    #keyboard.on_press_key('.', stop_clips)
-    #keyboard.on_press_key('/', force_validation)
     keyboard.on_press_key('s', sync_all_clips)
     keyboard.on_press_key('esc', stop_program)
     
     # Map the Player 2 keyboard presses
     keyboard.on_press_key(';', handle_semicolon_press)
-    # keyboard.on_press_key("'", stop_clips)
-    keyboard.on_press_key('.', lambda e: stop_clips(client, client2))
-    keyboard.on_press_key("'", lambda e: stop_clips(client, client2))
-    # keyboard.on_press_key('backslash', fire_scene)  # Fire Scene 1 for Player 1
-    # keyboard.on_press_key('/', fire_scene)   # Fire Scene 1 for Player 2
-    keyboard.on_press_key('backslash', lambda e: fire_scene(client, client2))
-    keyboard.on_press_key('/', lambda e: fire_scene(client, client2))
+    keyboard.on_press_key('.', lambda e: stop_clips(client, client2_clients))
+    keyboard.on_press_key("'", lambda e: stop_clips(client, client2_clients))
+    keyboard.on_press_key('backslash', lambda e: fire_scene(client, client2_clients))
+    keyboard.on_press_key('/', lambda e: fire_scene(client, client2_clients))
 
     # Start periodic updates
     def periodic_update():
