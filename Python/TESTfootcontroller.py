@@ -66,14 +66,14 @@ def delete_scene(client, client2_clients, e=None):
         client.send_message("/live/clip_slot/delete_clip", [i, 0])
 
 def handle_toggletrack(client, addr, *args):
-    # addr: e.g. "/toggletrack/1/2/true"
-    parts = addr.split('/')
-    if len(parts) < 5:
-        print(f"Malformed address: {addr}")
+    # args should contain [player, track, state]
+    if len(args) < 3:
+        print(f"Malformed message: {args}")
         return
-    player = int(parts[2])
-    track = int(parts[3])
-    state = parts[4]  # "true" or "false"
+    
+    player = int(args[0])
+    track = int(args[1])
+    state = args[2]  # boolean value
 
     # Map to Ableton track index
     if player == 1:
@@ -86,21 +86,13 @@ def handle_toggletrack(client, addr, *args):
 
     print(f"Player {player}, Track {track} (Ableton track {track_id}), State: {state}")
 
-    if state == "true":
+    if state:
         # Fire (play) the clip in slot 0
         client.send_message("/live/clip_slot/fire", [track_id, 0])
-        # Send to VR headsets via PC Transmitter port (9001)
-        for c in client2_clients:
-            c.send_message("/clipisplaying", [player, track_id, True])
-    elif state == "false":
+    else:
         # Stop the clip in slot 0
         client.send_message("/live/clip/stop", [track_id, 0])
-        # Send to VR headsets via PC Transmitter port (9001)
-        for c in client2_clients:
-            c.send_message("/clipisplaying", [player, track_id, False])
-    else:
-        print(f"Unknown state: {state}")
-
+                            
 def start_global_osc_server():
     global global_osc_server
     ip = "127.0.0.1"
@@ -115,7 +107,7 @@ def start_global_osc_server():
 def start_client2_osc_server(client, client2_clients):
     global client2_osc_server, client2_dispatcher
     client2_ip = "0.0.0.0"
-    client2_port = 9003  # PC Receiver port to receive messages from headsets
+    client2_port = 12000  # PC Receiver port to receive messages from headsets
 
     # Only create if not already running
     if client2_osc_server is not None:
@@ -126,7 +118,7 @@ def start_client2_osc_server(client, client2_clients):
     # Handle messages from VR headsets
     client2_dispatcher.map("/playall", lambda addr, *args: fire_scene(client, client2_clients, None) if args[0] else stop_clips(client, client2_clients, None))
     client2_dispatcher.map("/deleteall", lambda addr, *args: delete_scene(client, client2_clients, None))
-    client2_dispatcher.map("/toggletrack/*/*/*", lambda addr, *args: handle_toggletrack(client, addr, *args))
+    client2_dispatcher.map("/toggletrack", lambda addr, *args: handle_toggletrack(client, addr, *args))
 
     client2_osc_server = osc_server.ThreadingOSCUDPServer((client2_ip, client2_port), client2_dispatcher)
     thread = threading.Thread(target=client2_osc_server.serve_forever, daemon=True)
