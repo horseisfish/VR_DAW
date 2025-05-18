@@ -1,17 +1,20 @@
 ####Issues outstanding#####
-## needs OSC messages added to control Unity *some added
-## needs to consider main functions associated with Unity interaction (e.g. play, pause, delete tracks) * added not tested, need launch session
+## need to restart everytime it is run bc the track order gets screwed up
+## need to fire scene but not working so currently firing all tracks which causes recording on armed tracks. not great
 # there is redundancy in the state_tracker that is worth optimizing
-# 255.255.255.255 port 9000 bricks the code without permissions
+# something weird happening with arming after last track has been reached (low priority)
  
 from pythonosc import udp_client, dispatcher, osc_server
 import time
 import keyboard
 import threading
 
-# Global OSC dispatcher and server for receiving Ableton responses on port 11001.
+# Global OSC dispatcher and server for receiving Ableton responses on port 11001 and from client 2 on client2_port
 global_dispatcher = dispatcher.Dispatcher()
 global_osc_server = None
+client2_dispatcher = dispatcher.Dispatcher()
+client2_osc_server = None
+
 base_clip_length = None  # Holds the length (in beats) of the first recorded clip.
 # Global toggling variables.
 waiting_for_refire_player1 = False
@@ -31,6 +34,58 @@ is_processing_player2 = False
 player1_lock = threading.Lock()
 player2_lock = threading.Lock()
 
+client = None  # global client variable
+client2 = None
+
+
+def fire_scene(client, e=None):
+    print("fire message sent for scene (only firing unarmed tracks)")
+    if client2 is not None:
+        client2.send_message("/pcplayall", [True])
+    for i in range(8):
+        client.send_message("/live/clip_slot/fire", [i, 0])
+
+def stop_clips(client, e=None):
+    print("Stopping all clips (playback only)...")
+    if client2 is not None:
+        client2.send_message("/pcplayall", [False])
+    client.send_message("/live/song/stop_all_clips", [])
+
+def delete_scene(client, e=None):
+    print("fire message sent for scene")
+    for i in range(8):
+        client.send_message("/live/clip_slot/delete_clip", [i, 0])
+
+def handle_toggletrack(client, addr, *args):
+    # addr: e.g. "/toggletrack/1/2/true"
+    parts = addr.split('/')
+    if len(parts) < 5:
+        print(f"Malformed address: {addr}")
+        return
+    player = int(parts[2])
+    track = int(parts[3])
+    state = parts[4]  # "true" or "false"
+
+    # Map to Ableton track index
+    if player == 1:
+        track_id = (track - 1) * 2  # 1→0, 2→2, 3→4, 4→6
+    elif player == 2:
+        track_id = (track - 1) * 2 + 1  # 1→1, 2→3, 3→5, 4→7
+    else:
+        print(f"Unknown player: {player}")
+        return
+
+    print(f"Player {player}, Track {track} (Ableton track {track_id}), State: {state}")
+
+    if state == "true":
+        # Fire (play) the clip in slot 0
+        client.send_message("/live/clip_slot/fire", [track_id, 0])
+    elif state == "false":
+        # Stop the clip in slot 0
+        client.send_message("/live/clip/stop", [track_id, 0])
+    else:
+        print(f"Unknown state: {state}")
+
 def start_global_osc_server():
     global global_osc_server
     ip = "127.0.0.1"
@@ -39,6 +94,33 @@ def start_global_osc_server():
     thread = threading.Thread(target=global_osc_server.serve_forever, daemon=True)
     thread.start()
     print(f"Global OSC server started on {ip}:{port}")
+    return thread
+
+
+def start_client2_osc_server(client):
+    global client2_osc_server, client2_dispatcher
+    client2_ip = "0.0.0.0"
+    client2_port = 12000
+
+    # Only create if not already running
+    if client2_osc_server is not None:
+        print(f"Client2 OSC server already running on {client2_ip}:{client2_port}")
+        return
+
+    # Use the global dispatcher
+    client2_dispatcher = dispatcher.Dispatcher()
+    client2_dispatcher.map("/playall", lambda addr, *args: fire_scene(client, None) if args[0] else stop_clips(client, None))
+    
+    #Delete all tracks
+    client2_dispatcher.map("/deleteall", lambda addr, *args: delete_scene(client, None))
+
+    #toggle tracks player 1 = /toggletrack/Player1/Track1/true or false
+    client2_dispatcher.map("/toggletrack/*/*/*", lambda addr, *args: handle_toggletrack(client, addr, *args))
+
+    client2_osc_server = osc_server.ThreadingOSCUDPServer((client2_ip, client2_port), client2_dispatcher)
+    thread = threading.Thread(target=client2_osc_server.serve_forever, daemon=True)
+    thread.start()
+    print(f"Client2 OSC server started on {client2_ip}:{client2_port}")
     return thread
 
 # --- State Tracking ---
@@ -481,12 +563,15 @@ def update_clip_lengths(client, state_tracker):
 def main():
     global running  # Use the global flag
     global waiting_for_refire_player1, waiting_for_refire_player2, current_active_track_player1, current_active_track_player2, all_clips_recorded
+    global client2
     start_global_osc_server()
     state_tracker = StateTracker()  # Single StateTracker for both players
     ip = "127.0.0.1"   # AbletonOSC sending address
     port = 11000       # AbletonOSC sending port
     client = udp_client.SimpleUDPClient(ip, port)
-    client2 = udp_client.SimpleUDPClient("192.168.0.1",1000) #maybe add ip_addresses to send to two ips (VR headsets)
+    #client2 = udp_client.SimpleUDPClient("192.168.0.1",1000) #maybe add ip_addresses to send to two ips (VR headsets)
+    client2 = udp_client.SimpleUDPClient("192.168.1.255",9000) #maybe add ip_addresses to send to two ips (VR headsets)
+    start_client2_osc_server(client)
     
     print(f"Attempting to connect to AbletonOSC server at {ip}:{port}")
     if not verify_ableton_connection(client):
@@ -509,47 +594,6 @@ def main():
     
     is_processing = False  # Local to main
 
-    # Add this function to handle incoming messages from client2
-    def handle_incoming_message(unused_addr, *args):
-        # Debug: print the received message
-        print(f"[DEBUG] Incoming message from client2: {args}")
-        
-        # Extract the track and clip information from the message
-        track_clip_info = args[:-1]  # All but the last argument
-        action = args[-1]  # The last part of the message indicates the action (play, pause, delete)
-
-        # Initialize variables to hold track and clip information
-        track_index = None
-        clip_slot_index = None
-
-        # Parse the track and clip information
-        for i in range(len(track_clip_info)):
-            if i % 3 == 0:  # Every first element in the triplet is a track identifier
-                track_index = int(track_clip_info[i][2]) - 1  # Convert 't1' to 0, 't2' to 1, etc.
-                clip_slot_index = int(track_clip_info[i + 1])  # The next element is the clip index
-                break  # We only need the first track and clip for the action
-
-        if track_index is None or clip_slot_index is None:
-            print("[ERROR] Unable to parse track and clip information.")
-            return
-
-        # Send the corresponding command to Ableton based on the action
-        if action == "play":
-            print(f"Playing clip in track {track_index + 1}, slot {clip_slot_index + 1}")
-            client.send_message("/live/clip_slot/fire", [track_index, clip_slot_index])
-        elif action == "pause":
-            print(f"Pausing clip in track {track_index + 1}, slot {clip_slot_index + 1}")
-            client.send_message("/live/clip/stop", [track_index, clip_slot_index])  # Adjust the message as needed
-        elif action == "delete":
-            print(f"Deleting clip in track {track_index + 1}, slot {clip_slot_index + 1}")
-            client.send_message("/live/clip_slot/delete_clip", [track_index, clip_slot_index])  # Adjust the message as needed
-        else:
-            print(f"[ERROR] Unknown action: {action}")
-
-    # Map the incoming OSC messages to the handler
-    global_dispatcher.map("/VROSC/t1/*/*/*/t2/*/*/*/t3/*/*/*/t4/*/*/*/t5/*/*/*/t6/*/*/*/t7/*/*/*/t8/*/*/*", handle_incoming_message)
-
-
 
     def handle_comma_press(e):
         global waiting_for_refire_player1, current_active_track_player1, is_processing_player1
@@ -568,7 +612,9 @@ def main():
             if waiting_for_refire_player1:
                 print(f"Player 1: Stopping track {current_active_track_player1 + 1}")
                 client.send_message("/live/clip_slot/fire", [current_active_track_player1, state_tracker.clip_slot_index])
-                client2.send_message("/sessiontrack", [1, current_active_track_player1])
+                client2.send_message("/playertrack", [1, current_active_track_player1])
+                client2.send_message("/clipisrecording", [1, current_active_track_player1, False])
+                print("/clipisrecording", [1, current_active_track_player1, False])
 
                 finalized_track = current_active_track_player1
                 next_track = state_tracker.get_next_track(current_active_track_player1, 1)
@@ -602,7 +648,9 @@ def main():
                     client.send_message("/live/track/set/arm", [i, 0])
                 client.send_message("/live/track/set/arm", [current_active_track_player1, 1])
                 client.send_message("/live/clip_slot/fire", [current_active_track_player1, state_tracker.clip_slot_index])
-                client2.send_message("/sessiontrack", [1, current_active_track_player1])
+                client2.send_message("/playertrack", [1, current_active_track_player1])
+                client2.send_message("/clipisrecording", [1, current_active_track_player1, True])
+                print("/clipisrecording", [1, current_active_track_player1, True])
 
                 with player1_lock:
                     waiting_for_refire_player1 = True
@@ -632,7 +680,8 @@ def main():
             if waiting_for_refire_player2:
                 print(f"Player 2: Stopping track {current_active_track_player2 + 1}")
                 client.send_message("/live/clip_slot/fire", [current_active_track_player2, state_tracker.clip_slot_index])
-                client2.send_message("/sessiontrack", [2, current_active_track_player2])
+                client2.send_message("/playertrack", [2, current_active_track_player2])
+                client2.send_message("/clipisrecording", [2, current_active_track_player2, False])
 
                 finalized_track = current_active_track_player2
                 next_track = state_tracker.get_next_track(current_active_track_player2, 2)
@@ -667,7 +716,8 @@ def main():
                     client.send_message("/live/track/set/arm", [i, 0])
                 client.send_message("/live/track/set/arm", [current_active_track_player2, 1])
                 client.send_message("/live/clip_slot/fire", [current_active_track_player2, state_tracker.clip_slot_index])
-                client2.send_message("/sessiontrack", [2, current_active_track_player2])
+                client2.send_message("/playertrack", [2, current_active_track_player2])
+                client2.send_message("/clipisrecording", [2, current_active_track_player2, True])
 
                 with player2_lock:
                     waiting_for_refire_player2 = True
@@ -681,36 +731,14 @@ def main():
                 is_processing_player2 = False
                 print(f"[DEBUG] POST: waiting_for_refire_player2={waiting_for_refire_player2}, current_active_track_player2={current_active_track_player2}, is_processing_player2={is_processing_player2}")
 
-
-    def fire_scene(e):
-        """
-        Fires the specified scene in Ableton.
-        """
-        print("fire message sent for scene")
-
-        for i in range(8):
-            client.send_message("/live/clip_slot/fire",[i,0])
-
-        # not working in ableton osc for some reason
-        # print(f"Firing Scene {scene_index + 1}...")
-        # client.send_message("/live/scene/fire", [scene_index])
-        # print(f"Sent OSC message: /live/scene/fire [{scene_index}]")
-    
-    def handle_up_press(e):
-        print("Up key pressed (no loop action)")
-    
-    def handle_down_press(e):
-        print("Down key pressed (no loop action)")
     
     def stop_program(e):
         global running
         print("Exiting foot controller...")
         running = False  # Set the flag to False to stop the program
 
-    def stop_clips(e):
-        print("Stopping all clips (playback only)...")
-        client.send_message("/live/song/stop_all_clips", [])
     
+    ## Leave in case needs to be reimplemented
     # def force_validation(e):
     #     nonlocal is_processing
     #     with threading.Lock():
@@ -739,18 +767,20 @@ def main():
         
     # Fix keyboard bindings
     keyboard.on_press_key(',', handle_comma_press)
-    keyboard.on_press_key('.', stop_clips)
+    #keyboard.on_press_key('.', stop_clips)
     #keyboard.on_press_key('/', force_validation)
     keyboard.on_press_key('s', sync_all_clips)
-    keyboard.on_press_key('up', handle_up_press)
-    keyboard.on_press_key('down', handle_down_press)
     keyboard.on_press_key('esc', stop_program)
     
     # Map the Player 2 keyboard presses
     keyboard.on_press_key(';', handle_semicolon_press)
-    keyboard.on_press_key("'", stop_clips)
-    keyboard.on_press_key('backslash', fire_scene)  # Fire Scene 1 for Player 1
-    keyboard.on_press_key('/', fire_scene)   # Fire Scene 1 for Player 2
+    # keyboard.on_press_key("'", stop_clips)
+    keyboard.on_press_key('.', lambda e: stop_clips(client, client2))
+    keyboard.on_press_key("'", lambda e: stop_clips(client, client2))
+    # keyboard.on_press_key('backslash', fire_scene)  # Fire Scene 1 for Player 1
+    # keyboard.on_press_key('/', fire_scene)   # Fire Scene 1 for Player 2
+    keyboard.on_press_key('backslash', lambda e: fire_scene(client, client2))
+    keyboard.on_press_key('/', lambda e: fire_scene(client, client2))
 
     # Start periodic updates
     def periodic_update():
@@ -761,6 +791,8 @@ def main():
             state_tracker.stop_background_validation()
             if global_osc_server:
                 global_osc_server.shutdown()  # Shutdown the OSC server
+            if client2_osc_server:
+                client2_osc_server.shutdown()  # Shutdown the client2 OSC server
 
     periodic_update()  # Start the periodic update
 
