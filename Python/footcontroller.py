@@ -1,6 +1,5 @@
 ####Issues outstanding#####
 ## need to restart everytime it is run bc the track order gets screwed up
-## need to fire scene but not working so currently firing all tracks which causes recording on armed tracks. not great
 # there is redundancy in the state_tracker that is worth optimizing
 # something weird happening with arming after last track has been reached (low priority)
  
@@ -35,36 +34,46 @@ player1_lock = threading.Lock()
 player2_lock = threading.Lock()
 
 client = None  # global client variable
-client2 = None
+client2_clients = []  # List of UDP clients for VR headsets
 
+# Helper function to send to all client2 addresses
+def send_to_all_client2_clients(clients, address, args):
+    for c in clients:
+        c.send_message(address, args)
 
-def fire_scene(client, e=None):
+def fire_scene(client, client2_clients, state_tracker, e=None):
     print("fire message sent for scene (only firing unarmed tracks)")
-    if client2 is not None:
-        client2.send_message("/pcplayall", [True])
+    # Send to VR headsets via PC Transmitter port (9001)
+    for c in client2_clients:
+        c.send_message("/pcplayall", [True])
     for i in range(8):
-        client.send_message("/live/clip_slot/fire", [i, 0])
+        if not state_tracker.get_track_is_armed(i):
+            client.send_message("/live/clip_slot/fire", [i, 0])
 
-def stop_clips(client, e=None):
+def stop_clips(client, client2_clients, e=None):
     print("Stopping all clips (playback only)...")
-    if client2 is not None:
-        client2.send_message("/pcplayall", [False])
+    # Send to VR headsets via PC Transmitter port (9001)
+    for c in client2_clients:
+        c.send_message("/pcplayall", [False])
     client.send_message("/live/song/stop_all_clips", [])
 
-def delete_scene(client, e=None):
+def delete_scene(client, client2_clients, e=None):
     print("fire message sent for scene")
+    # Send to VR headsets via PC Transmitter port (9001)
+    for c in client2_clients:
+        c.send_message("/deleteall", [True])
     for i in range(8):
         client.send_message("/live/clip_slot/delete_clip", [i, 0])
 
 def handle_toggletrack(client, addr, *args):
-    # addr: e.g. "/toggletrack/1/2/true"
-    parts = addr.split('/')
-    if len(parts) < 5:
-        print(f"Malformed address: {addr}")
+    # args should contain [player, track, state]
+    if len(args) < 3:
+        print(f"Malformed message: {args}")
         return
-    player = int(parts[2])
-    track = int(parts[3])
-    state = parts[4]  # "true" or "false"
+    
+    player = int(args[0])
+    track = int(args[1])
+    state = args[2]  # boolean value
 
     # Map to Ableton track index
     if player == 1:
@@ -77,15 +86,13 @@ def handle_toggletrack(client, addr, *args):
 
     print(f"Player {player}, Track {track} (Ableton track {track_id}), State: {state}")
 
-    if state == "true":
+    if state:
         # Fire (play) the clip in slot 0
         client.send_message("/live/clip_slot/fire", [track_id, 0])
-    elif state == "false":
+    else:
         # Stop the clip in slot 0
         client.send_message("/live/clip/stop", [track_id, 0])
-    else:
-        print(f"Unknown state: {state}")
-
+                            
 def start_global_osc_server():
     global global_osc_server
     ip = "127.0.0.1"
@@ -97,25 +104,21 @@ def start_global_osc_server():
     return thread
 
 
-def start_client2_osc_server(client):
+def start_client2_osc_server(client, client2_clients, state_tracker):
     global client2_osc_server, client2_dispatcher
     client2_ip = "0.0.0.0"
-    client2_port = 12000
+    client2_port = 12000  # PC Receiver port to receive messages from headsets
 
     # Only create if not already running
     if client2_osc_server is not None:
         print(f"Client2 OSC server already running on {client2_ip}:{client2_port}")
         return
 
-    # Use the global dispatcher
     client2_dispatcher = dispatcher.Dispatcher()
-    client2_dispatcher.map("/playall", lambda addr, *args: fire_scene(client, None) if args[0] else stop_clips(client, None))
-    
-    #Delete all tracks
-    client2_dispatcher.map("/deleteall", lambda addr, *args: delete_scene(client, None))
-
-    #toggle tracks player 1 = /toggletrack/Player1/Track1/true or false
-    client2_dispatcher.map("/toggletrack/*/*/*", lambda addr, *args: handle_toggletrack(client, addr, *args))
+    # Handle messages from VR headsets
+    client2_dispatcher.map("/playall", lambda addr, *args: fire_scene(client, client2_clients, state_tracker) if args[0] else stop_clips(client, client2_clients, None))
+    client2_dispatcher.map("/deleteall", lambda addr, *args: delete_scene(client, client2_clients, None))
+    client2_dispatcher.map("/toggletrack", lambda addr, *args: handle_toggletrack(client, addr, *args))
 
     client2_osc_server = osc_server.ThreadingOSCUDPServer((client2_ip, client2_port), client2_dispatcher)
     thread = threading.Thread(target=client2_osc_server.serve_forever, daemon=True)
@@ -128,6 +131,7 @@ class StateTracker:
     def __init__(self):
         # Designated tracks: Player 1 (1, 3, 5, 7) and Player 2 (2, 4, 6, 8)
         self.track_has_clip = {0: False, 1: False, 2: False, 3: False, 4: False, 5: False, 6: False, 7: False}
+        self.track_is_armed = {0: False, 1: False, 2: False, 3: False, 4: False, 5: False, 6: False, 7: False}  # New: armed state
         self.clip_slot_index = 0  # Always using the first clip slot.
         self.validation_interval = 7.0  # For background validation.
         self.validation_running = False
@@ -139,6 +143,16 @@ class StateTracker:
             if track_index in self.track_has_clip:
                 self.track_has_clip[track_index] = has_clip
                 print(f"Internal state updated: Track {track_index+1} has clip: {has_clip}")
+
+    def mark_track_is_armed(self, track_index, is_armed):
+        with self.lock:
+            if track_index in self.track_is_armed:
+                self.track_is_armed[track_index] = is_armed
+                print(f"Internal state updated: Track {track_index+1} is armed: {is_armed}")
+
+    def get_track_is_armed(self, track_index):
+        with self.lock:
+            return self.track_is_armed.get(track_index, False)
     
     def get_next_empty_track(self, player):
         with self.lock:
@@ -214,11 +228,14 @@ class StateTracker:
         for track_idx in range(8):  # Check all tracks 1-8
             has_clip = check_track_has_clip(client, track_idx, self.clip_slot_index)
             self.mark_track_has_clip(track_idx, has_clip)
+            is_armed = check_track_is_armed(client, track_idx)
+            self.mark_track_is_armed(track_idx, is_armed)
 
         filled_tracks = [t + 1 for t in self.get_filled_tracks(1)] + [t + 1 for t in self.get_filled_tracks(2)]
         empty_tracks = [t + 1 for t in self.get_empty_tracks(1)] + [t + 1 for t in self.get_empty_tracks(2)]
         print(f"Current state - Tracks with clips: {filled_tracks if filled_tracks else 'none'}")
         print(f"Current state - Empty tracks: {empty_tracks if empty_tracks else 'none'}")
+        print(f"Current state - Armed tracks: {[i+1 for i, v in self.track_is_armed.items() if v]}")
 
     def get_clip_presence_grid(self, client):
         """
@@ -234,16 +251,16 @@ class StateTracker:
                 grid.append(1 if has_clip else 0)  # Append 1 if there's a clip, otherwise 0
 
         return grid
-
+    
     def send_clip_presence_update(self, client2, ip_addresses):
         """
         Sends the OSC message reflecting the presence of clips to the specified IP addresses.
+        Format: /VROSC with arguments [0, 1, 0, 1, ...] (1 if track has a clip, 0 otherwise)
         """
-        grid = self.get_clip_presence_grid(client2)
-        for ip in ip_addresses:
-            message = f"/VROSC/t1/{grid[0]}/{grid[1]}/{grid[2]}/t2/{grid[3]}/{grid[4]}/{grid[5]}/t3/{grid[6]}/{grid[7]}/{grid[8]}/t4/{grid[9]}/{grid[10]}/{grid[11]}/t5/{grid[12]}/{grid[13]}/{grid[14]}/t6/{grid[15]}/{grid[16]}/{grid[17]}/t7/{grid[18]}/{grid[19]}/{grid[20]}/t8/{grid[21]}/{grid[22]}/{grid[23]}"
-            client2.send_message(message, [])
-            print(f"Sent OSC message to {ip}: {message}")
+        track_states = [1 if self.track_has_clip[track_idx] else 0 for track_idx in range(8)]
+        for c in client2_clients:
+            c.send_message("/VROSC", track_states)
+            print(f"Sent OSC message to {c}: /VROSC {track_states}")
 
     def get_next_track(self, current_track, player):
         """
@@ -528,11 +545,29 @@ def check_track_has_clip(client, track_index, clip_slot_index):
     start_time = time.time()
     while not event.is_set() and time.time() - start_time < 0.5:  # Increased timeout
         time.sleep(0.01)  # Increased polling interval
-    global_dispatcher.unmap("/live/clip_slot/get/has_clip/return", handler)
-    global_dispatcher.unmap("/live/clip_slot/get/has_clip", handler)
-    global_dispatcher.unmap("/live/clip/get/exists/return", handler)
     if result[0] is None:
         print(f"No response received for track {track_index+1}; assuming no clip.")
+        return False
+    return result[0]
+
+def check_track_is_armed(client, track_index):
+    print(f"Checking if track {track_index+1} is armed...")
+    event = threading.Event()
+    result = [None]
+    def handler(unused_addr, *args):
+        if len(args) >= 2:
+            if int(args[0]) == track_index:
+                result[0] = bool(args[1])
+                event.set()
+                print(f"Response: Track {track_index+1} is armed: {result[0]}")
+    global_dispatcher.map("/live/track/get/arm", handler)
+    client.send_message("/live/track/get/arm", [track_index])
+    start_time = time.time()
+    while not event.is_set() and time.time() - start_time < 0.5:
+        time.sleep(0.01)
+    global_dispatcher.unmap("/live/track/get/arm", handler)
+    if result[0] is None:
+        print(f"No response received for track {track_index+1}; assuming not armed.")
         return False
     return result[0]
 
@@ -563,15 +598,16 @@ def update_clip_lengths(client, state_tracker):
 def main():
     global running  # Use the global flag
     global waiting_for_refire_player1, waiting_for_refire_player2, current_active_track_player1, current_active_track_player2, all_clips_recorded
-    global client2
+    global client2_clients
     start_global_osc_server()
     state_tracker = StateTracker()  # Single StateTracker for both players
     ip = "127.0.0.1"   # AbletonOSC sending address
     port = 11000       # AbletonOSC sending port
     client = udp_client.SimpleUDPClient(ip, port)
-    #client2 = udp_client.SimpleUDPClient("192.168.0.1",1000) #maybe add ip_addresses to send to two ips (VR headsets)
-    client2 = udp_client.SimpleUDPClient("192.168.1.255",9000) #maybe add ip_addresses to send to two ips (VR headsets)
-    start_client2_osc_server(client)
+    ip_addresses = ["192.168.1.28","192.168.1.10","192.168.1.11"]  # IP addresses for VR headsets
+    # Create clients for PC Transmitter port (9001) to send messages to headsets
+    client2_clients = [udp_client.SimpleUDPClient(ip, 9003) for ip in ip_addresses]
+    start_client2_osc_server(client, client2_clients, state_tracker)
     
     print(f"Attempting to connect to AbletonOSC server at {ip}:{port}")
     if not verify_ableton_connection(client):
@@ -580,7 +616,7 @@ def main():
     
     # Initial validation for both players
     state_tracker.validate_state_with_ableton(client)
-    ip_addresses = ["255.255.255.255"]  # IP addresses for VR headsets
+    # ip_addresses = ["192.168.1.28","192.168.1.10","192.168.1.11"]  # IP addresses for VR headsets
     state_tracker.start_background_validation(client, ip_addresses)
 
     print("Foot controller started. Player 1 controls")
@@ -612,17 +648,33 @@ def main():
             if waiting_for_refire_player1:
                 print(f"Player 1: Stopping track {current_active_track_player1 + 1}")
                 client.send_message("/live/clip_slot/fire", [current_active_track_player1, state_tracker.clip_slot_index])
-                client2.send_message("/playertrack", [1, current_active_track_player1])
-                client2.send_message("/clipisrecording", [1, current_active_track_player1, False])
-                print("/clipisrecording", [1, current_active_track_player1, False])
+                # Send to VR headsets via PC Transmitter port (9001)
+                if current_active_track_player1 == 0: 
+                    for c in client2_clients:
+                        c.send_message("/clipisplaying", [1, current_active_track_player1, True])
+                        c.send_message("/clipisrecording", [1, current_active_track_player1, False])
+                elif current_active_track_player1 == 2: 
+                    for c in client2_clients:
+                        c.send_message("/clipisplaying", [1, current_active_track_player1-1, True])
+                        c.send_message("/clipisrecording", [1, current_active_track_player1-1, False])
+                elif current_active_track_player1 == 4: 
+                    for c in client2_clients:
+                        c.send_message("/clipisplaying", [1, current_active_track_player1 - 2, True])
+                        c.send_message("/clipisrecording", [1, current_active_track_player1 - 2, False])
+                elif current_active_track_player1 == 6: 
+                    for c in client2_clients:
+                        c.send_message("/clipisplaying", [1, current_active_track_player1 - 3, True])
+                        c.send_message("/clipisrecording", [1, current_active_track_player1 - 3, False])
+                
 
                 finalized_track = current_active_track_player1
                 next_track = state_tracker.get_next_track(current_active_track_player1, 1)
 
+                # Disarm all tracks and arm the next track
                 for i in [0, 2, 4, 6]:
                     client.send_message("/live/track/set/arm", [i, 0])
-                client.send_message("/live/track/set/arm", [next_track, 1])
-                print(f"Player 1: Armed next track {next_track + 1}")
+                #client.send_message("/live/track/set/arm", [next_track, 1])
+                #print(f"Player 1: Armed next track {next_track + 1}")
 
                 with player1_lock:
                     current_active_track_player1 = next_track
@@ -648,9 +700,19 @@ def main():
                     client.send_message("/live/track/set/arm", [i, 0])
                 client.send_message("/live/track/set/arm", [current_active_track_player1, 1])
                 client.send_message("/live/clip_slot/fire", [current_active_track_player1, state_tracker.clip_slot_index])
-                client2.send_message("/playertrack", [1, current_active_track_player1])
-                client2.send_message("/clipisrecording", [1, current_active_track_player1, True])
-                print("/clipisrecording", [1, current_active_track_player1, True])
+                # Send to VR headsets via PC Transmitter port (9001)
+                if current_active_track_player1 == 0: 
+                    for c in client2_clients:
+                        c.send_message("/clipisrecording", [1, current_active_track_player1, True])
+                elif current_active_track_player1 == 2: 
+                    for c in client2_clients:
+                        c.send_message("/clipisrecording", [1, current_active_track_player1-1, True])
+                elif current_active_track_player1 == 4: 
+                    for c in client2_clients:
+                        c.send_message("/clipisrecording", [1, current_active_track_player1 - 2, True])
+                elif current_active_track_player1 == 6: 
+                    for c in client2_clients:
+                        c.send_message("/clipisrecording", [1, current_active_track_player1 - 3, True])
 
                 with player1_lock:
                     waiting_for_refire_player1 = True
@@ -680,16 +742,32 @@ def main():
             if waiting_for_refire_player2:
                 print(f"Player 2: Stopping track {current_active_track_player2 + 1}")
                 client.send_message("/live/clip_slot/fire", [current_active_track_player2, state_tracker.clip_slot_index])
-                client2.send_message("/playertrack", [2, current_active_track_player2])
-                client2.send_message("/clipisrecording", [2, current_active_track_player2, False])
+                # Send to VR headsets via PC Transmitter port (9001)
+                if current_active_track_player2 == 1: 
+                    for c in client2_clients:
+                        c.send_message("/clipisplaying", [2, current_active_track_player2-1, True])
+                        c.send_message("/clipisrecording", [2, current_active_track_player2-1, False])
+                elif current_active_track_player2 == 3: 
+                    for c in client2_clients:
+                        c.send_message("/clipisplaying", [2, current_active_track_player2 - 2, True])
+                        c.send_message("/clipisrecording", [2, current_active_track_player2 - 2, False])
+                elif current_active_track_player2 == 5: 
+                    for c in client2_clients:
+                        c.send_message("/clipisplaying", [2, current_active_track_player2 - 3, True])
+                        c.send_message("/clipisrecording", [2, current_active_track_player2 - 3, False])
+                elif current_active_track_player2 == 7: 
+                    for c in client2_clients:
+                        c.send_message("/clipisplaying", [2, current_active_track_player2 - 4, True])
+                        c.send_message("/clipisrecording", [2, current_active_track_player2 - 4, False])
 
                 finalized_track = current_active_track_player2
                 next_track = state_tracker.get_next_track(current_active_track_player2, 2)
 
+                # Disarm all tracks and arm the next track
                 for i in [1, 3, 5, 7]:
                     client.send_message("/live/track/set/arm", [i, 0])
-                client.send_message("/live/track/set/arm", [next_track, 1])
-                print(f"Player 2: Armed next track {next_track + 1}")
+                #client.send_message("/live/track/set/arm", [next_track, 1])
+                #print(f"Player 2: Armed next track {next_track + 1}")
 
                 with player2_lock:
                     current_active_track_player2 = next_track
@@ -716,8 +794,19 @@ def main():
                     client.send_message("/live/track/set/arm", [i, 0])
                 client.send_message("/live/track/set/arm", [current_active_track_player2, 1])
                 client.send_message("/live/clip_slot/fire", [current_active_track_player2, state_tracker.clip_slot_index])
-                client2.send_message("/playertrack", [2, current_active_track_player2])
-                client2.send_message("/clipisrecording", [2, current_active_track_player2, True])
+                # Send to VR headsets via PC Transmitter port (9001)
+                if current_active_track_player2 == 1: 
+                    for c in client2_clients:
+                        c.send_message("/clipisrecording", [2, current_active_track_player2-1, True])
+                elif current_active_track_player2 == 3: 
+                    for c in client2_clients:
+                        c.send_message("/clipisrecording", [2, current_active_track_player2 - 2, True])
+                elif current_active_track_player2 == 5: 
+                    for c in client2_clients:
+                        c.send_message("/clipisrecording", [2, current_active_track_player2 - 3, True])
+                elif current_active_track_player2 == 7: 
+                    for c in client2_clients:
+                        c.send_message("/clipisrecording", [2, current_active_track_player2 - 4, True])
 
                 with player2_lock:
                     waiting_for_refire_player2 = True
@@ -767,20 +856,15 @@ def main():
         
     # Fix keyboard bindings
     keyboard.on_press_key(',', handle_comma_press)
-    #keyboard.on_press_key('.', stop_clips)
-    #keyboard.on_press_key('/', force_validation)
     keyboard.on_press_key('s', sync_all_clips)
     keyboard.on_press_key('esc', stop_program)
     
     # Map the Player 2 keyboard presses
     keyboard.on_press_key(';', handle_semicolon_press)
-    # keyboard.on_press_key("'", stop_clips)
-    keyboard.on_press_key('.', lambda e: stop_clips(client, client2))
-    keyboard.on_press_key("'", lambda e: stop_clips(client, client2))
-    # keyboard.on_press_key('backslash', fire_scene)  # Fire Scene 1 for Player 1
-    # keyboard.on_press_key('/', fire_scene)   # Fire Scene 1 for Player 2
-    keyboard.on_press_key('backslash', lambda e: fire_scene(client, client2))
-    keyboard.on_press_key('/', lambda e: fire_scene(client, client2))
+    keyboard.on_press_key('.', lambda e: stop_clips(client, client2_clients))
+    keyboard.on_press_key("'", lambda e: stop_clips(client, client2_clients))
+    keyboard.on_press_key('backslash', lambda e: fire_scene(client, client2_clients, state_tracker))
+    keyboard.on_press_key('/', lambda e: fire_scene(client, client2_clients, state_tracker))
 
     # Start periodic updates
     def periodic_update():

@@ -253,33 +253,14 @@ class StateTracker:
         return grid
     
     def send_clip_presence_update(self, client2, ip_addresses):
-            """
-            Sends the OSC message reflecting the presence of clips to the specified IP addresses.
-            Format: /VROSC/t1/0/0/t2/0/0/t3/0/0/t4/0/0/t5/0/0/t6/0/0/t7/0/0/t8/0/0
-            Where each track (t1-t8) has 2 values (one for each player)
-            """
-            # Initialize a list to store clip presence for each track and player
-            track_states = []
-            
-            # For each track (1-8)
-            for track_idx in range(8):
-                track_states.append(f"t{track_idx + 1}")
-                # For each player (1-2)
-                for player in range(2):
-                    # Check if this track belongs to this player and has a clip
-                    if player == 0:  # Player 1 tracks (0,2,4,6)
-                        has_clip = self.track_has_clip[track_idx] if track_idx % 2 == 0 else False
-                    else:  # Player 2 tracks (1,3,5,7)
-                        has_clip = self.track_has_clip[track_idx] if track_idx % 2 == 1 else False
-                    track_states.append(str(1 if has_clip else 0))
-            
-            # Construct the message address
-            message_address = "/VROSC/" + "/".join(track_states)
-            
-            # Send the message to each IP address
-            for ip in ip_addresses:
-                client2.send_message(message_address, [])
-                print(f"Sent OSC message to {ip}: {message_address}")
+        """
+        Sends the OSC message reflecting the presence of clips to the specified IP addresses.
+        Format: /VROSC with arguments [0, 1, 0, 1, ...] (1 if track has a clip, 0 otherwise)
+        """
+        track_states = [1 if self.track_has_clip[track_idx] else 0 for track_idx in range(8)]
+        for c in client2_clients:
+            c.send_message("/VROSC", track_states)
+            print(f"Sent OSC message to {c}: /VROSC {track_states}")
 
     def get_next_track(self, current_track, player):
         """
@@ -360,7 +341,7 @@ def enforce_clip_loop_points(client, track_index, clip_slot_index, expected_star
         # Send commands with delay between them
         client.send_message("/live/clip/set/loop_start", [track_index, clip_slot_index, expected_start])
         time.sleep(0.05)
-        client.send_message("/live/clip/set/loop_end", [track_index, clip_index, expected_end])
+        client.send_message("/live/clip/set/loop_end", [track_index, clip_slot_index, expected_end])
         
         time.sleep(0.5)  # Wait for commands to be processed
         
@@ -635,7 +616,7 @@ def main():
     
     # Initial validation for both players
     state_tracker.validate_state_with_ableton(client)
-    ip_addresses = ["192.168.1.28","192.168.1.10"]  # IP addresses for VR headsets
+    # ip_addresses = ["192.168.1.28","192.168.1.10","192.168.1.11"]  # IP addresses for VR headsets
     state_tracker.start_background_validation(client, ip_addresses)
 
     print("Foot controller started. Player 1 controls")
@@ -668,17 +649,32 @@ def main():
                 print(f"Player 1: Stopping track {current_active_track_player1 + 1}")
                 client.send_message("/live/clip_slot/fire", [current_active_track_player1, state_tracker.clip_slot_index])
                 # Send to VR headsets via PC Transmitter port (9001)
-                for c in client2_clients:
-                    c.send_message("/playertrack", [1, current_active_track_player1])
-                    c.send_message("/clipisrecording", [1, current_active_track_player1, False])
+                if current_active_track_player1 == 0: 
+                    for c in client2_clients:
+                        c.send_message("/clipisplaying", [1, current_active_track_player1, True])
+                        c.send_message("/clipisrecording", [1, current_active_track_player1, False])
+                elif current_active_track_player1 == 2: 
+                    for c in client2_clients:
+                        c.send_message("/clipisplaying", [1, current_active_track_player1-1, True])
+                        c.send_message("/clipisrecording", [1, current_active_track_player1-1, False])
+                elif current_active_track_player1 == 4: 
+                    for c in client2_clients:
+                        c.send_message("/clipisplaying", [1, current_active_track_player1 - 2, True])
+                        c.send_message("/clipisrecording", [1, current_active_track_player1 - 2, False])
+                elif current_active_track_player1 == 6: 
+                    for c in client2_clients:
+                        c.send_message("/clipisplaying", [1, current_active_track_player1 - 3, True])
+                        c.send_message("/clipisrecording", [1, current_active_track_player1 - 3, False])
+                
 
                 finalized_track = current_active_track_player1
                 next_track = state_tracker.get_next_track(current_active_track_player1, 1)
 
+                # Disarm all tracks and arm the next track
                 for i in [0, 2, 4, 6]:
                     client.send_message("/live/track/set/arm", [i, 0])
-                client.send_message("/live/track/set/arm", [next_track, 1])
-                print(f"Player 1: Armed next track {next_track + 1}")
+                #client.send_message("/live/track/set/arm", [next_track, 1])
+                #print(f"Player 1: Armed next track {next_track + 1}")
 
                 with player1_lock:
                     current_active_track_player1 = next_track
@@ -705,9 +701,18 @@ def main():
                 client.send_message("/live/track/set/arm", [current_active_track_player1, 1])
                 client.send_message("/live/clip_slot/fire", [current_active_track_player1, state_tracker.clip_slot_index])
                 # Send to VR headsets via PC Transmitter port (9001)
-                for c in client2_clients:
-                    c.send_message("/playertrack", [1, current_active_track_player1])
-                    c.send_message("/clipisrecording", [1, current_active_track_player1, True])
+                if current_active_track_player1 == 0: 
+                    for c in client2_clients:
+                        c.send_message("/clipisrecording", [1, current_active_track_player1, True])
+                elif current_active_track_player1 == 2: 
+                    for c in client2_clients:
+                        c.send_message("/clipisrecording", [1, current_active_track_player1-1, True])
+                elif current_active_track_player1 == 4: 
+                    for c in client2_clients:
+                        c.send_message("/clipisrecording", [1, current_active_track_player1 - 2, True])
+                elif current_active_track_player1 == 6: 
+                    for c in client2_clients:
+                        c.send_message("/clipisrecording", [1, current_active_track_player1 - 3, True])
 
                 with player1_lock:
                     waiting_for_refire_player1 = True
@@ -738,17 +743,31 @@ def main():
                 print(f"Player 2: Stopping track {current_active_track_player2 + 1}")
                 client.send_message("/live/clip_slot/fire", [current_active_track_player2, state_tracker.clip_slot_index])
                 # Send to VR headsets via PC Transmitter port (9001)
-                for c in client2_clients:
-                    c.send_message("/playertrack", [2, current_active_track_player2])
-                    c.send_message("/clipisrecording", [2, current_active_track_player2, False])
+                if current_active_track_player2 == 1: 
+                    for c in client2_clients:
+                        c.send_message("/clipisplaying", [2, current_active_track_player2-1, True])
+                        c.send_message("/clipisrecording", [2, current_active_track_player2-1, False])
+                elif current_active_track_player2 == 3: 
+                    for c in client2_clients:
+                        c.send_message("/clipisplaying", [2, current_active_track_player2 - 2, True])
+                        c.send_message("/clipisrecording", [2, current_active_track_player2 - 2, False])
+                elif current_active_track_player2 == 5: 
+                    for c in client2_clients:
+                        c.send_message("/clipisplaying", [2, current_active_track_player2 - 3, True])
+                        c.send_message("/clipisrecording", [2, current_active_track_player2 - 3, False])
+                elif current_active_track_player2 == 7: 
+                    for c in client2_clients:
+                        c.send_message("/clipisplaying", [2, current_active_track_player2 - 4, True])
+                        c.send_message("/clipisrecording", [2, current_active_track_player2 - 4, False])
 
                 finalized_track = current_active_track_player2
                 next_track = state_tracker.get_next_track(current_active_track_player2, 2)
 
+                # Disarm all tracks and arm the next track
                 for i in [1, 3, 5, 7]:
                     client.send_message("/live/track/set/arm", [i, 0])
-                client.send_message("/live/track/set/arm", [next_track, 1])
-                print(f"Player 2: Armed next track {next_track + 1}")
+                #client.send_message("/live/track/set/arm", [next_track, 1])
+                #print(f"Player 2: Armed next track {next_track + 1}")
 
                 with player2_lock:
                     current_active_track_player2 = next_track
@@ -776,9 +795,18 @@ def main():
                 client.send_message("/live/track/set/arm", [current_active_track_player2, 1])
                 client.send_message("/live/clip_slot/fire", [current_active_track_player2, state_tracker.clip_slot_index])
                 # Send to VR headsets via PC Transmitter port (9001)
-                for c in client2_clients:
-                    c.send_message("/playertrack", [2, current_active_track_player2])
-                    c.send_message("/clipisrecording", [2, current_active_track_player2, True])
+                if current_active_track_player2 == 1: 
+                    for c in client2_clients:
+                        c.send_message("/clipisrecording", [2, current_active_track_player2-1, True])
+                elif current_active_track_player2 == 3: 
+                    for c in client2_clients:
+                        c.send_message("/clipisrecording", [2, current_active_track_player2 - 2, True])
+                elif current_active_track_player2 == 5: 
+                    for c in client2_clients:
+                        c.send_message("/clipisrecording", [2, current_active_track_player2 - 3, True])
+                elif current_active_track_player2 == 7: 
+                    for c in client2_clients:
+                        c.send_message("/clipisrecording", [2, current_active_track_player2 - 4, True])
 
                 with player2_lock:
                     waiting_for_refire_player2 = True
