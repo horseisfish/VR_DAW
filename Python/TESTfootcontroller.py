@@ -1,7 +1,9 @@
 ####Issues outstanding#####
-## need to restart everytime it is run bc the track order gets screwed up
+## need to restart everytime it is run bc the track order gets screwed up, implment reset function after delete all
+## loop points update sometimes to be way shorter than expected 
 # there is redundancy in the state_tracker that is worth optimizing
 # something weird happening with arming after last track has been reached (low priority)
+# takes a while for the track to start up
  
 from pythonosc import udp_client, dispatcher, osc_server
 import time
@@ -74,6 +76,7 @@ def handle_toggletrack(client, addr, *args):
     player = int(args[0])
     track = int(args[1])
     state = args[2]  # boolean value
+    
 
     # Map to Ableton track index
     if player == 1:
@@ -89,9 +92,13 @@ def handle_toggletrack(client, addr, *args):
     if state:
         # Fire (play) the clip in slot 0
         client.send_message("/live/clip_slot/fire", [track_id, 0])
+        # for c in client2_clients:
+        #     c.send_message("/clipisplaying", [player, track-1, state])
     else:
         # Stop the clip in slot 0
         client.send_message("/live/clip/stop", [track_id, 0])
+        # for c in client2_clients:
+        #     c.send_message("/clipisplaying", [player, track-1, state])
                             
 def start_global_osc_server():
     global global_osc_server
