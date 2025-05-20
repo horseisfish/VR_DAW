@@ -139,6 +139,7 @@ class StateTracker:
         # Designated tracks: Player 1 (1, 3, 5, 7) and Player 2 (2, 4, 6, 8)
         self.track_has_clip = {0: False, 1: False, 2: False, 3: False, 4: False, 5: False, 6: False, 7: False}
         self.track_is_armed = {0: False, 1: False, 2: False, 3: False, 4: False, 5: False, 6: False, 7: False}  # New: armed state
+        self.track_is_recording = {0: False, 1: False, 2: False, 3: False, 4: False, 5: False, 6: False, 7: False}  # New: recording state
         self.clip_slot_index = 0  # Always using the first clip slot.
         self.validation_interval = 7.0  # For background validation.
         self.validation_running = False
@@ -237,12 +238,15 @@ class StateTracker:
             self.mark_track_has_clip(track_idx, has_clip)
             is_armed = check_track_is_armed(client, track_idx)
             self.mark_track_is_armed(track_idx, is_armed)
+            is_recording = check_track_is_recording(client, track_idx, self.clip_slot_index)
+            self.mark_track_is_recording(track_idx, is_recording)
 
-        filled_tracks = [t + 1 for t in self.get_filled_tracks(1)] + [t + 1 for t in self.get_filled_tracks(2)]
-        empty_tracks = [t + 1 for t in self.get_empty_tracks(1)] + [t + 1 for t in self.get_empty_tracks(2)]
-        print(f"Current state - Tracks with clips: {filled_tracks if filled_tracks else 'none'}")
-        print(f"Current state - Empty tracks: {empty_tracks if empty_tracks else 'none'}")
-        print(f"Current state - Armed tracks: {[i+1 for i, v in self.track_is_armed.items() if v]}")
+            filled_tracks = [t + 1 for t in self.get_filled_tracks(1)] + [t + 1 for t in self.get_filled_tracks(2)]
+            empty_tracks = [t + 1 for t in self.get_empty_tracks(1)] + [t + 1 for t in self.get_empty_tracks(2)]
+            print(f"Current state - Tracks with clips: {filled_tracks if filled_tracks else 'none'}")
+            print(f"Current state - Empty tracks: {empty_tracks if empty_tracks else 'none'}")
+            print(f"Current state - Armed tracks: {[i+1 for i, v in self.track_is_armed.items() if v]}")
+            print(f"Current state - Recording tracks: {[i+1 for i, v in self.track_is_recording.items() if v]}")
 
     def get_clip_presence_grid(self, client):
         """
@@ -282,6 +286,16 @@ class StateTracker:
         current_index = designated_tracks.index(current_track)
         next_index = (current_index + 1) % len(designated_tracks)
         return designated_tracks[next_index]
+
+    def mark_track_is_recording(self, track_index, is_recording):
+        with self.lock:
+            if track_index in self.track_is_recording:
+                self.track_is_recording[track_index] = is_recording
+                print(f"Internal state updated: Track {track_index+1} is recording: {is_recording}")
+
+    def get_track_is_recording(self, track_index):
+        with self.lock:
+            return self.track_is_recording.get(track_index, False)
 
 # --- OSC Query Helpers ---
 def query_clip_loop_points(client, track_index, clip_slot_index, timeout=6.0):
@@ -348,7 +362,7 @@ def enforce_clip_loop_points(client, track_index, clip_slot_index, expected_star
         # Send commands with delay between them
         client.send_message("/live/clip/set/loop_start", [track_index, clip_slot_index, expected_start])
         time.sleep(0.05)
-        client.send_message("/live/clip/set/loop_end", [track_index, clip_slot_index, expected_end])
+        client.send_message("/live/clip/set/loop_end", [track_index, clip_index, expected_end])
         
         time.sleep(0.5)  # Wait for commands to be processed
         
@@ -575,6 +589,27 @@ def check_track_is_armed(client, track_index):
     global_dispatcher.unmap("/live/track/get/arm", handler)
     if result[0] is None:
         print(f"No response received for track {track_index+1}; assuming not armed.")
+        return False
+    return result[0]
+
+def check_track_is_recording(client, track_index, clip_slot_index):
+    print(f"Checking if track {track_index+1}, slot {clip_slot_index+1} is recording...")
+    event = threading.Event()
+    result = [None]
+    def handler(unused_addr, *args):
+        if len(args) >= 3:
+            if int(args[0]) == track_index and int(args[1]) == clip_slot_index:
+                result[0] = bool(args[2])
+                event.set()
+                print(f"Response: Track {track_index+1}, slot {clip_slot_index+1} is recording: {result[0]}")
+    global_dispatcher.map("/live/clip/get/is_recording", handler)
+    client.send_message("/live/clip/get/is_recording", [track_index, clip_slot_index])
+    start_time = time.time()
+    while not event.is_set() and time.time() - start_time < 0.5:
+        time.sleep(0.01)
+    global_dispatcher.unmap("/live/clip/get/is_recording", handler)
+    if result[0] is None:
+        print(f"No response received for track {track_index+1}, slot {clip_slot_index+1}; assuming not recording.")
         return False
     return result[0]
 
