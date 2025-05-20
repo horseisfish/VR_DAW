@@ -142,8 +142,9 @@ class StateTracker:
         self.track_has_clip = {0: False, 1: False, 2: False, 3: False, 4: False, 5: False, 6: False, 7: False}
         self.track_is_armed = {0: False, 1: False, 2: False, 3: False, 4: False, 5: False, 6: False, 7: False}  # New: armed state
         self.track_is_recording = {0: False, 1: False, 2: False, 3: False, 4: False, 5: False, 6: False, 7: False}  # New: recording state
+        self.track_is_playing = {i: False for i in range(8)}
         self.clip_slot_index = 0  # Always using the first clip slot.
-        self.validation_interval = 7.0  # For background validation.
+        self.validation_interval = 1.0  #7.0 worked but the faster the better # For background validation.
         self.validation_running = False
         self.validation_thread = None
         self.lock = threading.Lock()
@@ -228,7 +229,7 @@ class StateTracker:
             try:
                 print("\n=== Background validation running ===")
                 self.validate_state_with_ableton(client)
-                self.send_clip_presence_update(client, ip_addresses)  # Send OSC message
+                self.send_full_clip_state_update(client2_clients)
                 print("=== Background validation complete ===\n")
             except Exception as e:
                 print(f"Error in background validation: {e}")
@@ -242,6 +243,8 @@ class StateTracker:
             self.mark_track_is_armed(track_idx, is_armed)
             is_recording = check_track_is_recording(client, track_idx, self.clip_slot_index)
             self.mark_track_is_recording(track_idx, is_recording)
+            is_playing = check_track_is_playing(client, track_idx, self.clip_slot_index)
+            self.mark_track_is_playing(track_idx, is_playing)
 
             filled_tracks = [t + 1 for t in self.get_filled_tracks(1)] + [t + 1 for t in self.get_filled_tracks(2)]
             empty_tracks = [t + 1 for t in self.get_empty_tracks(1)] + [t + 1 for t in self.get_empty_tracks(2)]
@@ -249,6 +252,8 @@ class StateTracker:
             print(f"Current state - Empty tracks: {empty_tracks if empty_tracks else 'none'}")
             print(f"Current state - Armed tracks: {[i+1 for i, v in self.track_is_armed.items() if v]}")
             print(f"Current state - Recording tracks: {[i+1 for i, v in self.track_is_recording.items() if v]}")
+
+        self.send_full_clip_state_update(client2_clients)
 
     def get_clip_presence_grid(self, client):
         """
@@ -265,15 +270,15 @@ class StateTracker:
 
         return grid
     
-    def send_clip_presence_update(self, client2, ip_addresses):
-        """
-        Sends the OSC message reflecting the presence of clips to the specified IP addresses.
-        Format: /VROSC with arguments [0, 1, 0, 1, ...] (1 if track has a clip, 0 otherwise)
-        """
-        track_states = [1 if self.track_has_clip[track_idx] else 0 for track_idx in range(8)]
+    def send_full_clip_state_update(self, client2_clients):
+        presence = [1 if self.track_has_clip[i] else 0 for i in range(8)]
+        playing = [1 if self.track_is_playing[i] else 0 for i in range(8)]
+        recording = [1 if self.track_is_recording[i] else 0 for i in range(8)]
         for c in client2_clients:
-            c.send_message("/VROSC", track_states)
-            print(f"Sent OSC message to {c}: /VROSC {track_states}")
+            c.send_message("/VROSC/presence", presence)
+            c.send_message("/VROSC/playing", playing)
+            c.send_message("/VROSC/recording", recording)
+            print(f"Sent OSC to {c}: presence={presence}, playing={playing}, recording={recording}")
 
     def get_next_track(self, current_track, player):
         """
@@ -298,6 +303,16 @@ class StateTracker:
     def get_track_is_recording(self, track_index):
         with self.lock:
             return self.track_is_recording.get(track_index, False)
+
+    def mark_track_is_playing(self, track_index, is_playing):
+        with self.lock:
+            if track_index in self.track_is_playing:
+                self.track_is_playing[track_index] = is_playing
+                print(f"Internal state updated: Track {track_index+1} is playing: {is_playing}")
+
+    def get_track_is_playing(self, track_index):
+        with self.lock:
+            return self.track_is_playing.get(track_index, False)
 
 # --- OSC Query Helpers ---
 def query_clip_loop_points(client, track_index, clip_slot_index, timeout=6.0):
@@ -609,6 +624,27 @@ def check_track_is_recording(client, track_index, clip_slot_index):
     global_dispatcher.unmap("/live/clip/get/is_recording", handler)
     if result[0] is None:
         print(f"No response received for track {track_index+1}, slot {clip_slot_index+1}; assuming not recording.")
+        return False
+    return result[0]
+
+def check_track_is_playing(client, track_index, clip_slot_index):
+    print(f"Checking if track {track_index+1}, slot {clip_slot_index+1} is playing...")
+    event = threading.Event()
+    result = [None]
+    def handler(unused_addr, *args):
+        if len(args) >= 3:
+            if int(args[0]) == track_index and int(args[1]) == clip_slot_index:
+                result[0] = bool(args[2])
+                event.set()
+                print(f"Response: Track {track_index+1}, slot {clip_slot_index+1} is playing: {result[0]}")
+    global_dispatcher.map("/live/clip/get/is_playing", handler)
+    client.send_message("/live/clip/get/is_playing", [track_index, clip_slot_index])
+    start_time = time.time()
+    while not event.is_set() and time.time() - start_time < 0.5:
+        time.sleep(0.01)
+    global_dispatcher.unmap("/live/clip/get/is_playing", handler)
+    if result[0] is None:
+        print(f"No response received for track {track_index+1}, slot {clip_slot_index+1}; assuming not playing.")
         return False
     return result[0]
 
