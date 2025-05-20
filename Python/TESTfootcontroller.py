@@ -1,9 +1,8 @@
 ####Issues outstanding#####
 ## need to restart everytime it is run bc the track order gets screwed up, implment reset function after delete all
-## loop points update sometimes to be way shorter than expected 
 # there is redundancy in the state_tracker that is worth optimizing
-# something weird happening with arming after last track has been reached (low priority)
 # takes a while for the track to start up
+# if the delete from VR is implemented for single tracks, make sure you can't delete the first clip from player 1 bc it's the base clip
  
 from pythonosc import udp_client, dispatcher, osc_server
 import time
@@ -60,12 +59,15 @@ def stop_clips(client, client2_clients, e=None):
     client.send_message("/live/song/stop_all_clips", [])
 
 def delete_scene(client, client2_clients, e=None):
+    global base_clip_length
     print("fire message sent for scene")
     # Send to VR headsets via PC Transmitter port (9001)
     for c in client2_clients:
         c.send_message("/deleteall", [True])
     for i in range(8):
         client.send_message("/live/clip_slot/delete_clip", [i, 0])
+    # Reset base_clip_length if first clip is deleted
+    base_clip_length = None
 
 def handle_toggletrack(client, addr, *args):
     # args should contain [player, track, state]
@@ -362,7 +364,7 @@ def enforce_clip_loop_points(client, track_index, clip_slot_index, expected_star
         # Send commands with delay between them
         client.send_message("/live/clip/set/loop_start", [track_index, clip_slot_index, expected_start])
         time.sleep(0.05)
-        client.send_message("/live/clip/set/loop_end", [track_index, clip_index, expected_end])
+        client.send_message("/live/clip/set/loop_end", [track_index, clip_slot_index, expected_end])
         
         time.sleep(0.5)  # Wait for commands to be processed
         
@@ -428,9 +430,6 @@ def finalize_recording(client, track_index, clip_slot_index, state_tracker):
         if base_clip_length is None and track_index == 0 and clip_slot_index == 0:
             base_clip_length = clip_length
             print(f"[DEBUG] Base clip length updated to {base_clip_length} beats (from first clip).")
-        elif base_clip_length is not None and clip_length < base_clip_length:
-            base_clip_length = clip_length
-            print(f"[DEBUG] Base clip length updated to {base_clip_length} beats (from subsequent clip).")
 
         if state_tracker.are_all_tracks_filled(1) or state_tracker.are_all_tracks_filled(2):
             print("[DEBUG] All designated tracks now have clips. Starting synchronization after delay...")
