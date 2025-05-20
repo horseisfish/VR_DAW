@@ -694,7 +694,7 @@ def main():
     ip = "127.0.0.1"   # AbletonOSC sending address
     port = 11000       # AbletonOSC sending port
     client = udp_client.SimpleUDPClient(ip, port)
-    ip_addresses = ["192.168.1.28","192.168.1.10","192.168.1.11"]  # IP addresses for VR headsets
+    ip_addresses = ["192.168.1.26","192.168.1.211","192.168.1.11"]  # IP addresses for VR headsets
     # Create clients for PC Transmitter port (9001) to send messages to headsets
     client2_clients = [udp_client.SimpleUDPClient(ip, 9003) for ip in ip_addresses]
     start_client2_osc_server(client, client2_clients, state_tracker)
@@ -706,7 +706,6 @@ def main():
     
     # Initial validation for both players
     state_tracker.validate_state_with_ableton(client)
-    # ip_addresses = ["192.168.1.28","192.168.1.10","192.168.1.11"]  # IP addresses for VR headsets
     state_tracker.start_background_validation(client, ip_addresses)
 
     print("Foot controller started. Player 1 controls")
@@ -741,19 +740,19 @@ def main():
                 # Send to VR headsets via PC Transmitter port (9001)
                 if current_active_track_player1 == 0: 
                     for c in client2_clients:
-                        c.send_message("/clipisplaying", [1, current_active_track_player1, True])
+                        #c.send_message("/clipisplaying", [1, current_active_track_player1, True])
                         c.send_message("/clipisrecording", [1, current_active_track_player1, False])
                 elif current_active_track_player1 == 2: 
                     for c in client2_clients:
-                        c.send_message("/clipisplaying", [1, current_active_track_player1-1, True])
+                        #c.send_message("/clipisplaying", [1, current_active_track_player1-1, True])
                         c.send_message("/clipisrecording", [1, current_active_track_player1-1, False])
                 elif current_active_track_player1 == 4: 
                     for c in client2_clients:
-                        c.send_message("/clipisplaying", [1, current_active_track_player1 - 2, True])
+                        #c.send_message("/clipisplaying", [1, current_active_track_player1 - 2, True])
                         c.send_message("/clipisrecording", [1, current_active_track_player1 - 2, False])
                 elif current_active_track_player1 == 6: 
                     for c in client2_clients:
-                        c.send_message("/clipisplaying", [1, current_active_track_player1 - 3, True])
+                        #c.send_message("/clipisplaying", [1, current_active_track_player1 - 3, True])
                         c.send_message("/clipisrecording", [1, current_active_track_player1 - 3, False])
                 
 
@@ -835,19 +834,19 @@ def main():
                 # Send to VR headsets via PC Transmitter port (9001)
                 if current_active_track_player2 == 1: 
                     for c in client2_clients:
-                        c.send_message("/clipisplaying", [2, current_active_track_player2-1, True])
+                        #c.send_message("/clipisplaying", [2, current_active_track_player2-1, True])
                         c.send_message("/clipisrecording", [2, current_active_track_player2-1, False])
                 elif current_active_track_player2 == 3: 
                     for c in client2_clients:
-                        c.send_message("/clipisplaying", [2, current_active_track_player2 - 2, True])
+                        #c.send_message("/clipisplaying", [2, current_active_track_player2 - 2, True])
                         c.send_message("/clipisrecording", [2, current_active_track_player2 - 2, False])
                 elif current_active_track_player2 == 5: 
                     for c in client2_clients:
-                        c.send_message("/clipisplaying", [2, current_active_track_player2 - 3, True])
+                        #c.send_message("/clipisplaying", [2, current_active_track_player2 - 3, True])
                         c.send_message("/clipisrecording", [2, current_active_track_player2 - 3, False])
                 elif current_active_track_player2 == 7: 
                     for c in client2_clients:
-                        c.send_message("/clipisplaying", [2, current_active_track_player2 - 4, True])
+                        #c.send_message("/clipisplaying", [2, current_active_track_player2 - 4, True])
                         c.send_message("/clipisrecording", [2, current_active_track_player2 - 4, False])
 
                 finalized_track = current_active_track_player2
