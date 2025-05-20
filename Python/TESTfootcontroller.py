@@ -1,5 +1,4 @@
 ####Issues outstanding#####
-## need to restart everytime it is run bc the track order gets screwed up, implment reset function after delete all
 # there is redundancy in the state_tracker that is worth optimizing
 # takes a while for the track to start up
 # if the delete from VR is implemented for single tracks, make sure you can't delete the first clip from player 1 bc it's the base clip
@@ -58,16 +57,21 @@ def stop_clips(client, client2_clients, e=None):
         c.send_message("/pcplayall", [False])
     client.send_message("/live/song/stop_all_clips", [])
 
-def delete_scene(client, client2_clients, e=None):
-    global base_clip_length
+def delete_scene(client, client2_clients, state_tracker, e=None):
+    global base_clip_length, current_active_track_player1, current_active_track_player2
+    global waiting_for_refire_player1, waiting_for_refire_player2
     print("fire message sent for scene")
-    # Send to VR headsets via PC Transmitter port (9001)
     for c in client2_clients:
         c.send_message("/deleteall", [True])
     for i in range(8):
         client.send_message("/live/clip_slot/delete_clip", [i, 0])
-    # Reset base_clip_length if first clip is deleted
+    # Reset all state
     base_clip_length = None
+    current_active_track_player1 = None
+    current_active_track_player2 = None
+    waiting_for_refire_player1 = False
+    waiting_for_refire_player2 = False
+    state_tracker.reset()
 
 def handle_toggletrack(client, addr, *args):
     # args should contain [player, track, state]
@@ -126,7 +130,7 @@ def start_client2_osc_server(client, client2_clients, state_tracker):
     client2_dispatcher = dispatcher.Dispatcher()
     # Handle messages from VR headsets
     client2_dispatcher.map("/playall", lambda addr, *args: fire_scene(client, client2_clients, state_tracker) if args[0] else stop_clips(client, client2_clients, None))
-    client2_dispatcher.map("/deleteall", lambda addr, *args: delete_scene(client, client2_clients, None))
+    client2_dispatcher.map("/deleteall", lambda addr, *args: delete_scene(client, client2_clients, state_tracker, None))
     client2_dispatcher.map("/toggletrack", lambda addr, *args: handle_toggletrack(client, addr, *args))
 
     client2_osc_server = osc_server.ThreadingOSCUDPServer((client2_ip, client2_port), client2_dispatcher)
@@ -313,6 +317,15 @@ class StateTracker:
     def get_track_is_playing(self, track_index):
         with self.lock:
             return self.track_is_playing.get(track_index, False)
+
+    def reset(self):
+        with self.lock:
+            for i in range(8):
+                self.track_has_clip[i] = False
+                self.track_is_armed[i] = False
+                self.track_is_recording[i] = False
+                self.track_is_playing[i] = False
+        print("StateTracker: All track states reset.")
 
 # --- OSC Query Helpers ---
 def query_clip_loop_points(client, track_index, clip_slot_index, timeout=6.0):
