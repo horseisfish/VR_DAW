@@ -275,9 +275,9 @@ class StateTracker:
         playing = [1 if self.track_is_playing[i] else 0 for i in range(8)]
         recording = [1 if self.track_is_recording[i] else 0 for i in range(8)]
         for c in client2_clients:
-            c.send_message("/VROSC/presence", presence)
-            c.send_message("/VROSC/playing", playing)
-            c.send_message("/VROSC/recording", recording)
+            c.send_message("/VROSC/clippresence", presence)
+            c.send_message("/VROSC/clipisplaying", playing)
+            c.send_message("/VROSC/clipisrecording", recording)
             print(f"Sent OSC to {c}: presence={presence}, playing={playing}, recording={recording}")
 
     def get_next_track(self, current_track, player):
